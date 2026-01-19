@@ -1,0 +1,163 @@
+'use strict';
+
+class LocalStorage {
+    constructor() {
+        this.MEDIA_TYPE = {
+            audio: 'audio',
+            video: 'video',
+            audioVideo: 'audioVideo',
+            speaker: 'speaker',
+        };
+
+        this.INIT_CONFIG = {
+            audio: true,
+            video: true,
+            audioVideo: true,
+        };
+
+        this.SFU_SETTINGS = {
+            share_on_join: true, // katılma sırasında açılır mesaj
+            show_chat_on_msg: true, // yeni mesajda sohbeti göster
+            transcript_persistent_mode: false, // Konuşma yapılmaması durumunda çevirinin durdurulmasını önleyin
+            transcript_show_on_msg: true, // yeni mesajda çeviriyi göster
+            speech_in_msg: false, // gelen mesajı seslendirme
+            moderator_audio_start_muted: false, // Odadaki herkesin sesi kısıldı
+            moderator_video_start_hidden: false, // Odadaki herkesin görüntüsü kapatıldı
+            moderator_audio_cant_unmute: false, // Kimse kendi sesini açamaz
+            moderator_video_cant_unhide: false, // Kimse kendini gösteremez
+            moderator_screen_cant_share: false, // Kimse ekranı paylaşamaz
+            moderator_chat_cant_privately: false, // Kimse özel olarak sohbet edemez, yalnızca Genel sohbete izin verilir
+            moderator_chat_cant_chatgpt: false, // Kimse ChatGPT ile sohbet edemez
+            moderator_disconnect_all_on_leave: false, // İzinli odadaki tüm katılımcıların bağlantısını kesin
+            mic_auto_gain_control: false,
+            mic_echo_cancellations: true,
+            mic_noise_suppression: true,
+            mic_sample_rate: 0, // 0: 48000 Hz 1: 44100 Hz
+            mic_sample_size: 0, // 0: 16 bits 1: 32 bits
+            mic_channel_count: 0, // 0: 1(mono) 1: 2 (stereo)
+            mic_latency: 50, // ms
+            mic_volume: 100, // %
+            video_fps: 0, // varsayılan 1280x768 30fps
+            screen_fps: 3, // varsayılan 5fps
+            broadcasting: false, // varsayılan false (birden çoğa a/v akışı)
+            lobby: false, // varsayılan false
+            pitch_bar: true, // ses göstergesi
+            sounds: true, // oda bildirim sesleri
+            host_only_recording: false, // sunumcu
+            rec_prioritize_h264: false, // Opus codec'leri ile VP8 veya Opus codec'leri ile VP9 yerine AAC ile h.264'e veya Opus codec'leri ile h.264'e öncelik verin
+            rec_server: false, // Kayıt yerel olarak değil sunucuda saklanacak
+            video_obj_fit: 2, // örtme
+            video_controls: 0, // kapalı
+            theme: 0, // siyah
+            theme_color: '#000000', // özel tema rengi
+            theme_custom: false, // özel temayı koru
+            buttons_bar: 0, // dikey
+            pin_grid: 0, // dikey
+        };
+
+        this.DEVICES_COUNT = {
+            audio: 0,
+            speaker: 0,
+            video: 0,
+        };
+
+        this.LOCAL_STORAGE_DEVICES = {
+            audio: {
+                count: 0,
+                index: 0,
+                select: null,
+            },
+            speaker: {
+                count: 0,
+                index: 0,
+                select: null,
+            },
+            video: {
+                count: 0,
+                index: 0,
+                select: null,
+            },
+        };
+    }
+
+    // ####################################################
+    // YEREL DEPOLAMAYI AYARLA
+    // ####################################################
+
+    setItemLocalStorage(key, value) {
+        localStorage.setItem(key, value);
+    }
+
+    setObjectLocalStorage(name, object) {
+        localStorage.setItem(name, JSON.stringify(object));
+    }
+
+    setSettings(settings) {
+        this.SFU_SETTINGS = settings;
+        this.setObjectLocalStorage('SFU_SETTINGS', this.SFU_SETTINGS);
+    }
+
+    setInitConfig(type, status) {
+        switch (type) {
+            case this.MEDIA_TYPE.audio:
+                this.INIT_CONFIG.audio = status;
+                break;
+            case this.MEDIA_TYPE.video:
+                this.INIT_CONFIG.video = status;
+                break;
+            case this.MEDIA_TYPE.audioVideo:
+                this.INIT_CONFIG.audioVideo = status;
+                break;
+            default:
+                break;
+        }
+        this.setObjectLocalStorage('INIT_CONFIG', this.INIT_CONFIG);
+    }
+
+    setLocalStorageDevices(type, index, select) {
+        switch (type) {
+            case this.MEDIA_TYPE.audio:
+                this.LOCAL_STORAGE_DEVICES.audio.count = this.DEVICES_COUNT.audio;
+                this.LOCAL_STORAGE_DEVICES.audio.index = index;
+                this.LOCAL_STORAGE_DEVICES.audio.select = select;
+                break;
+            case this.MEDIA_TYPE.video:
+                this.LOCAL_STORAGE_DEVICES.video.count = this.DEVICES_COUNT.video;
+                this.LOCAL_STORAGE_DEVICES.video.index = index;
+                this.LOCAL_STORAGE_DEVICES.video.select = select;
+                break;
+            case this.MEDIA_TYPE.speaker:
+                this.LOCAL_STORAGE_DEVICES.speaker.count = this.DEVICES_COUNT.speaker;
+                this.LOCAL_STORAGE_DEVICES.speaker.index = index;
+                this.LOCAL_STORAGE_DEVICES.speaker.select = select;
+                break;
+            default:
+                break;
+        }
+        this.setObjectLocalStorage('LOCAL_STORAGE_DEVICES', this.LOCAL_STORAGE_DEVICES);
+    }
+
+    // ####################################################
+    // YEREL DEPOLAMAYI AL
+    // ####################################################
+
+    getLocalStorageSettings() {
+        return this.getObjectLocalStorage('SFU_SETTINGS');
+    }
+
+    getLocalStorageInitConfig() {
+        return this.getObjectLocalStorage('INIT_CONFIG');
+    }
+
+    getLocalStorageDevices() {
+        return this.getObjectLocalStorage('LOCAL_STORAGE_DEVICES');
+    }
+
+    getItemLocalStorage(key) {
+        localStorage.getItem(key);
+    }
+
+    getObjectLocalStorage(name) {
+        return JSON.parse(localStorage.getItem(name));
+    }
+}

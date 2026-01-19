@@ -3,20 +3,48 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "start": "node media-server.js",
+    "start": "node src/Server.js",
+    "start-dev": "nodemon src/Server.js",
+    "debug": "DEBUG='mediasoup*' node src/Server.js",
     "build": "docker build . -t hissechat-ai-service",
     "docker:login": "docker login registry.digitalocean.com",
     "docker:tag": "docker tag hissechat-ai-service registry.digitalocean.com/cyberistanbul/hissechat-ai-service:latest",
     "docker:push": "docker push registry.digitalocean.com/cyberistanbul/hissechat-ai-service:latest",
-    "deploy": "yarn docker:login && yarn build && yarn docker:tag && yarn docker:push"
+    "deploy": "yarn docker:login && yarn build && yarn docker:tag && yarn docker:push",
+    "lint": "npx prettier --write .",
+    "generate-cert": "node ssl/generate_cert.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.556.0",
-    "cors": "^2.8.5",
+    "@sentry/integrations": "7.114.0",
+    "@sentry/node": "7.114.0",
+    "axios": "^1.7.2",
+    "body-parser": "1.20.2",
+    "colors": "1.4.0",
+    "compression": "1.7.4",
+    "cors": "2.8.5",
+    "crypto-js": "4.2.0",
     "dotenv": "^16.3.1",
-    "express": "^4.18.2",
+    "express": "4.19.2",
+    "express-openid-connect": "^2.17.1",
+    "httpolyglot": "0.1.2",
+    "js-yaml": "^4.1.0",
     "jsonwebtoken": "^9.0.2",
-    "mediasoup": "3.13.24",
-    "socket.io": "^4.7.2"
+    "mediasoup": "3.14.7",
+    "mediasoup-client": "3.7.8",
+    "ngrok": "^5.0.0-beta.2",
+    "nodemailer": "^6.9.13",
+    "openai": "^4.49.1",
+    "qs": "6.12.1",
+    "socket.io": "4.7.5",
+    "swagger-ui-express": "5.0.1",
+    "uuid": "9.0.1",
+    "xss": "^1.0.15"
+  },
+  "devDependencies": {
+    "node-fetch": "^3.3.2",
+    "nodemon": "^3.1.3",
+    "prettier": "3.3.1",
+    "selfsigned": "^5.5.0"
   }
 }

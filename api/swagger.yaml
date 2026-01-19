@@ -1,0 +1,204 @@
+swagger: '2.0'
+
+info:
+    title: SAI-GM Video Chat SFU API
+    description: SAI-GM Video Chat SFU ile entegre olan harici uygulamalar için API açıklaması.
+    version: 1.0.1
+
+basePath: /api/v1
+
+schemes:
+    - https
+    - http
+
+paths:
+    /meetings:
+        get:
+            tags:
+                - 'meetings'
+            summary: 'Toplantı al'
+            description: 'Toplantı al'
+            produces:
+                - 'application/json'
+            security:
+                - secretApiKey: []
+            responses:
+                '200':
+                    description: 'Toplantı alındı'
+                    schema:
+                        $ref: '#/definitions/MeetingsResponse'
+                '403':
+                    description: 'Unauthorized!'
+    /meeting:
+        post:
+            tags:
+                - 'meeting'
+            summary: 'Toplantı oluştur'
+            description: 'Toplantı oluştur'
+            consumes:
+                - 'application/json'
+            produces:
+                - 'application/json'
+            security:
+                - secretApiKey: []
+            responses:
+                '200':
+                    description: 'Toplantı Oluşturuldu'
+                    schema:
+                        $ref: '#/definitions/MeetingResponse'
+                '403':
+                    description: 'Unauthorized!'
+    /join:
+        post:
+            tags:
+                - 'join'
+            summary: 'Doğrudan katıl'
+            description: 'Doğrudan katıl'
+            parameters:
+                - in: body
+                  name: Join
+                  description: Özel Katılma URL'i.
+                  schema:
+                      $ref: '#/definitions/JoinRequest'
+            consumes:
+                - 'application/json'
+            produces:
+                - 'application/json'
+            security:
+                - secretApiKey: []
+            responses:
+                '200':
+                    description: 'Doğrudan katılındı'
+                    schema:
+                        $ref: '#/definitions/JoinResponse'
+                '403':
+                    description: 'Unauthorized!'
+    /token:
+        post:
+            tags:
+                - 'token'
+            summary: 'Jeton getir'
+            description: 'Jeton getir'
+            parameters:
+                - in: body
+                  name: token
+                  description: Özel Jeton.
+                  schema:
+                      $ref: '#/definitions/TokenRequest'
+            consumes:
+                - 'application/json'
+            produces:
+                - 'application/json'
+            security:
+                - secretApiKey: []
+            responses:
+                '200':
+                    description: 'Jeton getirildi'
+                    schema:
+                        $ref: '#/definitions/TokenResponse'
+                '403':
+                    description: 'Unauthorized!'
+
+securityDefinitions:
+    secretApiKey:
+        type: 'apiKey'
+        name: 'authorization'
+        in: 'header'
+        description: 'Şu şekilde biçimlendirin: authorization: {API_KEY_SECRET}'
+
+definitions:
+    MeetingsResponse:
+        type: object
+        properties:
+            meetings:
+                type: array
+                items:
+                    $ref: '#/definitions/Meeting'
+    MeetingResponse:
+        type: 'object'
+        properties:
+            meeting:
+                type: string
+    JoinRequest:
+        type: object
+        properties:
+            room:
+                type: string
+                default: 'test'
+            roomPassword:
+                type: ['boolean', 'string'] # Boolean ve string tipine izin veriliyor
+                default: false
+            name:
+                type: string
+                default: 'saigmvideochatsfu'
+            audio:
+                type: boolean
+                default: false
+            video:
+                type: boolean
+                default: false
+            screen:
+                type: boolean
+                default: false
+            hide:
+                type: boolean
+                default: false
+            notify:
+                type: boolean
+                default: false
+            token:
+                $ref: '#/definitions/TokenRequest'
+    TokenRequest:
+        type: object
+        properties:
+            username:
+                type: string
+                default: 'username'
+            password:
+                type: string
+                default: 'password'
+            presenter:
+                type: boolean
+                default: true
+            expire:
+                type: string
+                default: '1h'
+    JoinResponse:
+        type: 'object'
+        properties:
+            join:
+                type: string
+    TokenResponse:
+        type: 'object'
+        properties:
+            token:
+                type: string
+    Peer:
+        type: object
+        properties:
+            name:
+                type: string
+            presenter:
+                type: boolean
+            video:
+                type: boolean
+            audio:
+                type: boolean
+            screen:
+                type: boolean
+            hand:
+                type: boolean
+            os:
+                type: string
+            browser:
+                type: string
+
+    Meeting:
+        type: object
+        properties:
+            roomId:
+                type: string
+            peers:
+                type: array
+                items:
+                    $ref: '#/definitions/Peer'
