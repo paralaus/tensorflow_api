@@ -12,4 +12,6 @@ gunicorn -c gunicorn.conf.py app:app &
 
 # Start Node.js Media Server in foreground
 echo "Starting Media Server..."
+# Ensure SSL certificates exist
+npm run generate-cert
 npm start

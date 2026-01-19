@@ -464,14 +464,14 @@ module.exports = {
                 {
                     protocol: 'udp',
                     ip: '0.0.0.0',
-                    announcedAddress: IPv4,
-                    portRange: { min: 40000, max: 40000 + numWorkers },
+                    announcedAddress: process.env.MEDIASOUP_ANNOUNCED_IP || IPv4,
+                    portRange: { min: 10000, max: 10000 + numWorkers },
                 },
                 {
                     protocol: 'tcp',
                     ip: '0.0.0.0',
-                    announcedAddress: IPv4,
-                    portRange: { min: 40000, max: 40000 + numWorkers },
+                    announcedAddress: process.env.MEDIASOUP_ANNOUNCED_IP || IPv4,
+                    portRange: { min: 10000, max: 10000 + numWorkers },
                 },
             ],
         },
@@ -483,14 +483,20 @@ module.exports = {
                 {
                     protocol: 'udp',
                     ip: '0.0.0.0',
-                    announcedAddress: IPv4,
-                    portRange: { min: 40000, max: 40100 },
+                    announcedAddress: process.env.MEDIASOUP_ANNOUNCED_IP || IPv4,
+                    portRange: {
+                        min: parseInt(process.env.MEDIASOUP_MIN_PORT) || 10000,
+                        max: parseInt(process.env.MEDIASOUP_MAX_PORT) || 10100
+                    },
                 },
                 {
                     protocol: 'tcp',
                     ip: '0.0.0.0',
-                    announcedAddress: IPv4,
-                    portRange: { min: 40000, max: 40100 },
+                    announcedAddress: process.env.MEDIASOUP_ANNOUNCED_IP || IPv4,
+                    portRange: {
+                        min: parseInt(process.env.MEDIASOUP_MIN_PORT) || 10000,
+                        max: parseInt(process.env.MEDIASOUP_MAX_PORT) || 10100
+                    },
                 },
             ],
             initialAvailableOutgoingBitrate: 1000000,
