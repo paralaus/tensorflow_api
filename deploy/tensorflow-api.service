@@ -1,0 +1,33 @@
+# Systemd Service Dosyası
+# Dosya yolu: /etc/systemd/system/tensorflow-api.service
+
+[Unit]
+Description=TensorFlow Flask API
+After=network.target
+
+[Service]
+User=root
+Group=root
+WorkingDirectory=/root/paralaus-project
+Environment="PATH=/root/paralaus-project/venv/bin"
+Environment="PORT=8000"
+ExecStart=/root/paralaus-project/venv/bin/gunicorn -c gunicorn.conf.py app:app
+Restart=always
+RestartSec=10
+
+# Timeout ayarları
+TimeoutStartSec=300
+TimeoutStopSec=30
+
+# Kaynak limitleri
+MemoryMax=28G
+CPUQuota=90%
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tensorflow-api
+
+[Install]
+WantedBy=multi-user.target
+

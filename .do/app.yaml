@@ -1,0 +1,13 @@
+name: hammerhead-app2
+services:
+  - name: web
+    github:
+      repo: paralaus/tensorflow_api
+      branch: main
+    run_command: python app.py
+    environment_slug: python
+    instance_size_slug: basic-xxs
+    instance_count: 1
+    http_port: 5000
+    routes:
+      - path: /

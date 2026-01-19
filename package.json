@@ -1,0 +1,22 @@
+{
+  "name": "hissechat-ai-service",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node media-server.js",
+    "build": "docker build . -t hissechat-ai-service",
+    "docker:login": "docker login registry.digitalocean.com",
+    "docker:tag": "docker tag hissechat-ai-service registry.digitalocean.com/cyberistanbul/hissechat-ai-service:latest",
+    "docker:push": "docker push registry.digitalocean.com/cyberistanbul/hissechat-ai-service:latest",
+    "deploy": "yarn docker:login && yarn build && yarn docker:tag && yarn docker:push"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.556.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.2",
+    "mediasoup": "3.13.24",
+    "socket.io": "^4.7.2"
+  }
+}

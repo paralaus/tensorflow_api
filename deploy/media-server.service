@@ -1,0 +1,25 @@
+[Unit]
+Description=HisseChat Media Server (WebRTC)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/paralaus-project
+Environment=NODE_ENV=production
+# Environment=PATH=/usr/bin:/usr/local/bin:$PATH
+
+# Script that detects IP and starts npm
+ExecStart=/bin/bash /root/paralaus-project/run-media-server.sh
+
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=media-server
+
+[Install]
+WantedBy=multi-user.target
