@@ -11,6 +11,15 @@ from datetime import datetime, timedelta
 app = Flask(__name__)
 CORS(app)  # React Native'den gelen istekler için
 
+# Sağlık Kontrolü Endpoint'i
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({
+        "status": "OK", 
+        "service": "AI Chat Service",
+        "groq_api": "Connected" if groq_client else "Disconnected"
+    }), 200
+
 # ============== YAPILANDIRMA ==============
 REQUEST_TIMEOUT = 45  # saniye - istek zaman aşımı (60'tan 45'e düşürüldü)
 MAX_NEW_TOKENS = 300  # chat için maksimum token (400'den 300'e düşürüldü - daha hızlı)
