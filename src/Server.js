@@ -74,6 +74,8 @@ const { spawn } = require('child_process');
 const os = require('os');
 require('dotenv').config();
 
+const app = express();
+
 // HLS / Spaces Configuration
 const SPACES_ENDPOINT = process.env.SPACES_ENDPOINT;
 const SPACES_KEY = process.env.SPACES_KEY;
@@ -251,7 +253,7 @@ function runFfmpegHls(inputPath, outputDir, segmentDurationSeconds = 6) {
   });
 }
 
-const app = express();
+
 
 const options = {
     cert: fs.existsSync(path.join(__dirname, '../ssl/cert.pem')) 

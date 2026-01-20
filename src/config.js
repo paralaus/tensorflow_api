@@ -465,13 +465,19 @@ module.exports = {
                     protocol: 'udp',
                     ip: '0.0.0.0',
                     announcedAddress: process.env.MEDIASOUP_ANNOUNCED_IP || IPv4,
-                    portRange: { min: 10000, max: 10000 + numWorkers },
+                    portRange: {
+                        min: parseInt(process.env.MEDIASOUP_MIN_PORT) || 40000,
+                        max: (parseInt(process.env.MEDIASOUP_MIN_PORT) || 40000) + numWorkers,
+                    },
                 },
                 {
                     protocol: 'tcp',
                     ip: '0.0.0.0',
                     announcedAddress: process.env.MEDIASOUP_ANNOUNCED_IP || IPv4,
-                    portRange: { min: 10000, max: 10000 + numWorkers },
+                    portRange: {
+                        min: parseInt(process.env.MEDIASOUP_MIN_PORT) || 40000,
+                        max: (parseInt(process.env.MEDIASOUP_MIN_PORT) || 40000) + numWorkers,
+                    },
                 },
             ],
         },
@@ -485,8 +491,8 @@ module.exports = {
                     ip: '0.0.0.0',
                     announcedAddress: process.env.MEDIASOUP_ANNOUNCED_IP || IPv4,
                     portRange: {
-                        min: parseInt(process.env.MEDIASOUP_MIN_PORT) || 10000,
-                        max: parseInt(process.env.MEDIASOUP_MAX_PORT) || 10100
+                        min: parseInt(process.env.MEDIASOUP_MIN_PORT) || 40000,
+                        max: parseInt(process.env.MEDIASOUP_MAX_PORT) || 40100
                     },
                 },
                 {
@@ -494,8 +500,8 @@ module.exports = {
                     ip: '0.0.0.0',
                     announcedAddress: process.env.MEDIASOUP_ANNOUNCED_IP || IPv4,
                     portRange: {
-                        min: parseInt(process.env.MEDIASOUP_MIN_PORT) || 10000,
-                        max: parseInt(process.env.MEDIASOUP_MAX_PORT) || 10100
+                        min: parseInt(process.env.MEDIASOUP_MIN_PORT) || 40000,
+                        max: parseInt(process.env.MEDIASOUP_MAX_PORT) || 40100
                     },
                 },
             ],
