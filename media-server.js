@@ -134,6 +134,7 @@ conferenceNsp.use((socket, next) => {
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     socket.userId = decoded.sub;
+    socket.isAdmin = !!(decoded.is_admin || decoded.role === 'admin' || decoded.admin);
     // We don't have DB access here, so we trust the token. 
     // Ideally token should contain name/avatar or client sends them in handshake query.
     socket.userName = socket.handshake.query.name || 'User';
@@ -145,9 +146,19 @@ conferenceNsp.use((socket, next) => {
 });
 
 conferenceNsp.on('connection', (socket) => {
-  console.log(`User connected: ${socket.userId} (${socket.userName})`);
+  console.log(`User connected: ${socket.userId} (${socket.userName}) [Admin: ${socket.isAdmin}]`);
 
-  socket.on('join-room', async ({ roomId }) => {
+  socket.on('join-room', async (data, callback) => {
+    // Handle both roomId and roomName (mobile app uses roomName)
+    const roomId = data.roomId || data.roomName;
+    const { userName, isCameraOn, isMicrophoneOn } = data;
+    
+    if (!roomId) {
+        console.error('join-room: Missing roomId/roomName');
+        if (typeof callback === 'function') callback({ error: 'Missing roomId' });
+        return;
+    }
+
     socket.join(roomId);
     
     // Create/Get Router
@@ -162,20 +173,33 @@ conferenceNsp.on('connection', (socket) => {
     }
 
     const room = rooms.get(roomId);
+    // Cleanup existing peer if any
+    if (room.peers.has(socket.id)) {
+        const oldPeer = room.peers.get(socket.id);
+        oldPeer.transports.forEach(t => t.close());
+    }
+    
     room.peers.set(socket.id, { transports: [], producers: [], consumers: [] });
 
+    console.log(`User joined room ${roomId}: ${socket.userName} (Admin: ${socket.isAdmin})`);
+
     // Send SFU mode confirmation (Always SFU in this service)
-    socket.emit('room-joined', {
+    const responseData = {
       roomId,
       mode: 'sfu',
+      isAdmin: socket.isAdmin,
       participants: [] // Client will get participants via user-joined events or can request them
-    });
+    };
+    
+    socket.emit('room-joined', responseData);
+    if (typeof callback === 'function') callback(responseData);
 
     socket.to(roomId).emit('user-joined', {
       socketId: socket.id,
       userId: socket.userId,
-      userName: socket.userName,
+      userName: socket.userName || userName, // Use socket.userName (from token) or fallback to data
       userAvatar: socket.userAvatar,
+      isAdmin: socket.isAdmin,
     });
   });
 
@@ -384,6 +408,189 @@ conferenceNsp.on('connection', (socket) => {
       } catch (err) {
           callback({ error: err.message });
       }
+  });
+
+  socket.on('sfu:resume-consumer', async ({ consumerId }, callback) => {
+      if (callback) callback({ resumed: true });
+  });
+
+  // --- LEGACY Handlers (Mobile App Compatibility) ---
+
+  socket.on('getRouterRtpCapabilities', (data, callback) => {
+    const cb = typeof data === 'function' ? data : callback;
+    let room;
+    for (const r of rooms.values()) {
+      if (r.peers.has(socket.id)) {
+        room = r;
+        break;
+      }
+    }
+    if (!room) return cb({ error: 'Not in a room' });
+    cb({ rtpCapabilities: room.router.rtpCapabilities });
+  });
+
+  socket.on('createWebRtcTransport', async ({ consumer }, callback) => {
+    try {
+        let room;
+        for (const r of rooms.values()) {
+          if (r.peers.has(socket.id)) {
+            room = r;
+            break;
+          }
+        }
+        if (!room) throw new Error('Not in room');
+
+        const transport = await room.router.createWebRtcTransport(mediasoupConfig.webRtcTransport);
+        const peer = room.peers.get(socket.id);
+        peer.transports.push(transport);
+
+        transport.on('dtlsstatechange', (dtlsState) => {
+            if (dtlsState === 'closed') transport.close();
+        });
+
+        callback({
+            id: transport.id,
+            iceParameters: transport.iceParameters,
+            iceCandidates: transport.iceCandidates,
+            dtlsParameters: transport.dtlsParameters,
+        });
+    } catch (err) {
+        callback({ error: err.message });
+    }
+  });
+
+  socket.on('connectTransport', async ({ transport_id, dtlsParameters }, callback) => {
+      try {
+        let room;
+        for (const r of rooms.values()) {
+          if (r.peers.has(socket.id)) {
+            room = r;
+            break;
+          }
+        }
+        if (!room) throw new Error('Not in room');
+        
+        const peer = room.peers.get(socket.id);
+        const transport = peer.transports.find(t => t.id === transport_id); // Note: transport_id
+        
+        if (!transport) throw new Error('Transport not found');
+        
+        await transport.connect({ dtlsParameters });
+        callback({ success: true });
+      } catch (err) {
+          callback({ error: err.message });
+      }
+  });
+
+  socket.on('produce', async ({ producerTransportId, kind, rtpParameters, appData }, callback) => {
+      try {
+        let room;
+        for (const r of rooms.values()) {
+          if (r.peers.has(socket.id)) {
+            room = r;
+            break;
+          }
+        }
+        if (!room) throw new Error('Not in room');
+
+        const peer = room.peers.get(socket.id);
+        const transport = peer.transports.find(t => t.id === producerTransportId); // Note: producerTransportId
+
+        if (!transport) throw new Error('Transport not found');
+
+        const producer = await transport.produce({ kind, rtpParameters, appData });
+        peer.producers.push(producer);
+
+        producer.on('transportclose', () => producer.close());
+
+        // Notify others
+        socket.to(Array.from(room.peers.keys())).emit('newProducers', [{
+            producer_id: producer.id,
+            producer_socket_id: socket.id,
+            kind: producer.kind,
+            appData: producer.appData
+        }]);
+        // Also emit sfu:new-producer for new clients
+        socket.to(Array.from(room.peers.keys())).emit('sfu:new-producer', {
+            producerId: producer.id,
+            producerSocketId: socket.id,
+            kind: producer.kind,
+            appData: producer.appData
+        });
+
+        callback({ producer_id: producer.id });
+      } catch (err) {
+          callback({ error: err.message });
+      }
+  });
+
+  socket.on('consume', async ({ producerId, consumerTransportId, rtpCapabilities }, callback) => {
+      try {
+        let room;
+        for (const r of rooms.values()) {
+            if (r.peers.has(socket.id)) {
+                room = r;
+                break;
+            }
+        }
+        if (!room) throw new Error('Not in room');
+        
+        const peer = room.peers.get(socket.id);
+        const transport = peer.transports.find(t => t.id === consumerTransportId); // Note: consumerTransportId
+
+        if (!transport) throw new Error('Transport not found');
+
+        if (!room.router.canConsume({ producerId, rtpCapabilities })) {
+            throw new Error('Cannot consume');
+        }
+
+        const consumer = await transport.consume({
+            producerId,
+            rtpCapabilities,
+            paused: true, // Start paused
+        });
+
+        peer.consumers.push(consumer);
+        
+        consumer.on('transportclose', () => consumer.close());
+        consumer.on('producerclose', () => {
+            socket.emit('consumerClosed', { consumer_id: consumer.id });
+            socket.emit('sfu:consumer-closed', { consumerId: consumer.id });
+            consumer.close();
+        });
+
+        callback({
+            id: consumer.id,
+            producerId,
+            kind: consumer.kind,
+            rtpParameters: consumer.rtpParameters,
+            type: consumer.type,
+            producerPaused: consumer.producerPaused
+        });
+        
+        // Resume immediately
+        await consumer.resume();
+
+      } catch (err) {
+          callback({ error: err.message });
+      }
+  });
+
+  socket.on('resumeConsumer', async ({ consumerId, consumer_id }, callback) => {
+      if (typeof callback === 'function') callback({ resumed: true });
+  });
+
+  // --- Mesh Fallback Signaling ---
+  socket.on('offer', (data) => {
+      socket.to(data.to).emit('offer', { ...data, from: socket.id });
+  });
+  
+  socket.on('answer', (data) => {
+      socket.to(data.to).emit('answer', { ...data, from: socket.id });
+  });
+  
+  socket.on('ice-candidate', (data) => {
+      socket.to(data.to).emit('ice-candidate', { ...data, from: socket.id });
   });
   
   // Also handle legacy signaling for chat/etc if needed, 

@@ -1,3 +1,5 @@
 /venv
 node_modules
 app.py
+.env
+docker-compose.yml

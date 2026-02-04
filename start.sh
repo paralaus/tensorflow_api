@@ -23,5 +23,10 @@ gunicorn -c gunicorn.conf.py app:app &
 # Start Node.js Media Server in foreground
 echo "Starting Media Server..."
 # Ensure SSL certificates exist
-npm run generate-cert
+if [ ! -f "ssl/cert.pem" ] || [ ! -f "ssl/key.pem" ]; then
+  echo "SSL certificates not found. Generating self-signed certificates..."
+  npm run generate-cert
+else
+  echo "SSL certificates found. Skipping generation."
+fi
 npm start

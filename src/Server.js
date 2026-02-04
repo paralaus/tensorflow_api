@@ -31,6 +31,7 @@ dependencies: {
  * SAI-GM Video Chat SFU - Sunucu bileşeni
  */
 
+require('dotenv').config();
 const express = require('express');
 const { auth, requiresAuth } = require('express-openid-connect');
 const cors = require('cors');
@@ -276,6 +277,10 @@ const io = require('socket.io')(httpsServer, {
     cors: corsOptions,
 });
 
+// Initialize Conference Namespace (for Admin and Mobile App compatibility)
+require('./ConferenceSocket')(io).catch(err => console.error('Failed to init conference socket:', err));
+
+
 const host = 'https://' + 'localhost' + ':' + config.server.listen.port; // config.server.listen.ip
 
 const jwtCfg = {
@@ -350,7 +355,7 @@ const OIDC = config.oidc ? config.oidc : { enabled: false };
 
 // dizin
 const dir = {
-    public: path.join(__dirname, '../../', 'public'),
+    public: path.join(__dirname, '../', 'public'),
     rec: path.join(__dirname, '../', config?.server?.recording?.dir ? config.server.recording.dir + '/' : 'rec/'),
 };
 
@@ -364,14 +369,14 @@ if (serverRecordingEnabled) {
 
 // HTML görünümleri
 const views = {
-    about: path.join(__dirname, '../../', 'public/views/about.html'),
-    landing: path.join(__dirname, '../../', 'public/views/landing.html'),
-    login: path.join(__dirname, '../../', 'public/views/login.html'),
-    newRoom: path.join(__dirname, '../../', 'public/views/newroom.html'),
-    notFound: path.join(__dirname, '../../', 'public/views/404.html'),
-    permission: path.join(__dirname, '../../', 'public/views/permission.html'),
-    privacy: path.join(__dirname, '../../', 'public/views/privacy.html'),
-    room: path.join(__dirname, '../../', 'public/views/Room.html'),
+    about: path.join(__dirname, '../', 'public/views/about.html'),
+    landing: path.join(__dirname, '../', 'public/views/landing.html'),
+    login: path.join(__dirname, '../', 'public/views/login.html'),
+    newRoom: path.join(__dirname, '../', 'public/views/newroom.html'),
+    notFound: path.join(__dirname, '../', 'public/views/404.html'),
+    permission: path.join(__dirname, '../', 'public/views/permission.html'),
+    privacy: path.join(__dirname, '../', 'public/views/privacy.html'),
+    room: path.join(__dirname, '../', 'public/views/Room.html'),
 };
 
 const authHost = new Host(); // Giriş yaparak doğrulanmış IP
