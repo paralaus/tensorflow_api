@@ -69,24 +69,29 @@ function getSpacesUrl(key) {
 }
 
 // ICE Servers Configuration (STUN + TURN)
+// Uses environment variables if set, otherwise falls back to defaults
+const TURN_URL = process.env.TURN_SERVER_URL || 'turn:api.appandcapital.com.tr:3478';
+const TURN_USER = process.env.TURN_SERVER_USERNAME || 'paralaus';
+const TURN_PASS = process.env.TURN_SERVER_CREDENTIAL || 'Pi3AlFa1970!';
+
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
-  // Free TURN servers for testing
+  // Own coturn server
   {
-    urls: 'turn:a.relay.metered.ca:80',
-    username: 'e8dd65c92f9c9c4e4c2df66f',
-    credential: 'uWdWNmkhvyqTH3/c'
+    urls: TURN_URL,
+    username: TURN_USER,
+    credential: TURN_PASS
   },
   {
-    urls: 'turn:a.relay.metered.ca:443',
-    username: 'e8dd65c92f9c9c4e4c2df66f',
-    credential: 'uWdWNmkhvyqTH3/c'
+    urls: TURN_URL + '?transport=tcp',
+    username: TURN_USER,
+    credential: TURN_PASS
   },
   {
-    urls: 'turn:a.relay.metered.ca:443?transport=tcp',
-    username: 'e8dd65c92f9c9c4e4c2df66f',
-    credential: 'uWdWNmkhvyqTH3/c'
+    urls: TURN_URL.replace('turn:', 'turns:').replace(':3478', ':5349'),
+    username: TURN_USER,
+    credential: TURN_PASS
   }
 ];
 
