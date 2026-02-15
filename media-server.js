@@ -68,6 +68,28 @@ function getSpacesUrl(key) {
   return `https://${SPACES_BUCKET}.${SPACES_ENDPOINT}/${key}`;
 }
 
+// ICE Servers Configuration (STUN + TURN)
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  // Free TURN servers for testing
+  {
+    urls: 'turn:a.relay.metered.ca:80',
+    username: 'e8dd65c92f9c9c4e4c2df66f',
+    credential: 'uWdWNmkhvyqTH3/c'
+  },
+  {
+    urls: 'turn:a.relay.metered.ca:443',
+    username: 'e8dd65c92f9c9c4e4c2df66f',
+    credential: 'uWdWNmkhvyqTH3/c'
+  },
+  {
+    urls: 'turn:a.relay.metered.ca:443?transport=tcp',
+    username: 'e8dd65c92f9c9c4e4c2df66f',
+    credential: 'uWdWNmkhvyqTH3/c'
+  }
+];
+
 // Mediasoup Config
 const mediasoupConfig = {
   worker: {
@@ -86,7 +108,11 @@ const mediasoupConfig = {
   },
   webRtcTransport: {
     listenIps: [{ ip: MEDIASOUP_LISTEN_IP, announcedIp: MEDIASOUP_ANNOUNCED_IP }],
+    enableUdp: true,
+    enableTcp: true, // Enable TCP fallback for firewall issues
+    preferUdp: true,
     initialAvailableOutgoingBitrate: 1000000,
+    maxIncomingBitrate: 1500000,
   },
 };
 
@@ -188,9 +214,11 @@ conferenceNsp.on('connection', (socket) => {
       roomId,
       mode: 'sfu',
       isAdmin: socket.isAdmin,
+      iceServers: ICE_SERVERS, // CRITICAL: Include TURN servers for NAT traversal
       participants: [] // Client will get participants via user-joined events or can request them
     };
     
+    console.log(`[MediaServer] Sending room-joined with ${ICE_SERVERS.length} ICE servers`);
     socket.emit('room-joined', responseData);
     if (typeof callback === 'function') callback(responseData);
 

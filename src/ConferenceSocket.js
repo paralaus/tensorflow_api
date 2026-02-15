@@ -12,6 +12,47 @@ const MEDIASOUP_MAX_PORT = parseInt(process.env.MEDIASOUP_MAX_PORT) || 40100;
 const MEDIASOUP_LISTEN_IP = process.env.MEDIASOUP_LISTEN_IP || '0.0.0.0';
 const MEDIASOUP_ANNOUNCED_IP = process.env.MEDIASOUP_ANNOUNCED_IP || '104.248.212.6'; // Public IP fallback
 
+// ICE Servers Configuration (STUN + TURN)
+// TURN server is CRITICAL for mobile users behind symmetric NAT
+const ICE_SERVERS = [
+  // Google STUN servers (free, reliable)
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  // Local TURN server (coturn) - recommended for production
+  // Configure your own TURN server for best results
+  ...(process.env.TURN_SERVER_URL ? [
+    {
+      urls: process.env.TURN_SERVER_URL,
+      username: process.env.TURN_SERVER_USERNAME || 'turnuser',
+      credential: process.env.TURN_SERVER_CREDENTIAL || 'turnpassword'
+    },
+    {
+      urls: process.env.TURN_SERVER_URL.replace('turn:', 'turns:').replace(':3478', ':5349'),
+      username: process.env.TURN_SERVER_USERNAME || 'turnuser',
+      credential: process.env.TURN_SERVER_CREDENTIAL || 'turnpassword'
+    }
+  ] : [
+    // Free TURN servers for testing (NOT for production - limited bandwidth)
+    // Metered.ca free tier
+    {
+      urls: 'turn:a.relay.metered.ca:80',
+      username: 'e8dd65c92f9c9c4e4c2df66f',
+      credential: 'uWdWNmkhvyqTH3/c'
+    },
+    {
+      urls: 'turn:a.relay.metered.ca:443',
+      username: 'e8dd65c92f9c9c4e4c2df66f',
+      credential: 'uWdWNmkhvyqTH3/c'
+    },
+    {
+      urls: 'turn:a.relay.metered.ca:443?transport=tcp',
+      username: 'e8dd65c92f9c9c4e4c2df66f',
+      credential: 'uWdWNmkhvyqTH3/c'
+    }
+  ])
+];
+
 // Mediasoup Config
 const mediasoupConfig = {
   worker: {
@@ -30,9 +71,20 @@ const mediasoupConfig = {
   },
   webRtcTransport: {
     listenIps: [{ ip: MEDIASOUP_LISTEN_IP, announcedIp: MEDIASOUP_ANNOUNCED_IP }],
+    enableUdp: true,
+    enableTcp: true, // IMPORTANT: Enable TCP fallback for firewall issues
+    preferUdp: true, // Prefer UDP but allow TCP fallback
     initialAvailableOutgoingBitrate: 1000000,
+    maxIncomingBitrate: 1500000,
   },
 };
+
+console.log('[ConferenceSocket] Mediasoup config:', {
+  listenIp: MEDIASOUP_LISTEN_IP,
+  announcedIp: MEDIASOUP_ANNOUNCED_IP,
+  portRange: `${MEDIASOUP_MIN_PORT}-${MEDIASOUP_MAX_PORT}`,
+  iceServersCount: ICE_SERVERS.length
+});
 
 // Global State
 let workers = [];
@@ -166,6 +218,7 @@ module.exports = async function init(io) {
         roomId,
         mode: 'sfu',
         isAdmin: socket.isAdmin,
+        iceServers: ICE_SERVERS, // CRITICAL: Send ICE servers including TURN for NAT traversal
         participants: Array.from(room.peers.values()).map(p => ({
             socketId: p.socketId,
             userId: p.userId,
@@ -175,7 +228,7 @@ module.exports = async function init(io) {
         }))
       };
       
-      console.log('[ConferenceSocket] Sending room-joined response:', JSON.stringify(responseData.participants.map(p => p.userName)));
+      console.log('[ConferenceSocket] Sending room-joined response with ICE servers:', ICE_SERVERS.length, 'servers,', responseData.participants.length, 'participants');
 
       socket.emit('room-joined', responseData);
       if (typeof callback === 'function') callback(responseData);
