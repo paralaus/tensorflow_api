@@ -129,9 +129,9 @@ module.exports = {
         protected: false,
         user_auth: false,
         users_from_db: false, // true ise api.token'ın da true olarak ayarlandığından emin olun.
-        //users_api_endpoint: 'http://localhost:9000/api/v1/user/isAuth',
-        users_api_endpoint: 'https://webrtc.alchemy.com/api/v1/user/isAuth',
-        users_api_secret_key: 'mirotalkweb_default_secret',
+        // User API endpoint (only used when users_from_db: true)
+        users_api_endpoint: 'https://api.appandcapital.com.tr/v1/user/isAuth',
+        users_api_secret_key: process.env.JWT_SECRET || 'your_secret_key',
         users: [
             {
                 username: 'username',
