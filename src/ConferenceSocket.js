@@ -270,7 +270,15 @@ module.exports = async function init(io) {
     });
 
     // SFU Handlers
-    const getRtpCapabilities = (callback) => {
+    const getRtpCapabilities = (dataOrCallback, maybeCallback) => {
+      // Support both (callback) and (data, callback) signatures
+      const callback = typeof dataOrCallback === 'function' ? dataOrCallback : maybeCallback;
+      
+      if (typeof callback !== 'function') {
+        console.error('[ConferenceSocket] getRtpCapabilities called without callback');
+        return;
+      }
+      
       let room;
       for (const r of rooms.values()) {
         if (r.peers.has(socket.id)) {
@@ -279,13 +287,24 @@ module.exports = async function init(io) {
         }
       }
       if (!room) return callback({ error: 'Not in a room' });
+      
+      console.log('[ConferenceSocket] Sending RTP capabilities');
       callback({ rtpCapabilities: room.router.rtpCapabilities });
     };
 
     socket.on('sfu:get-rtp-capabilities', getRtpCapabilities);
     socket.on('getRouterRtpCapabilities', getRtpCapabilities); // Legacy
 
-    const createTransport = async (callback) => {
+    const createTransport = async (dataOrCallback, maybeCallback) => {
+        // Support both (callback) and (data, callback) signatures
+        const callback = typeof dataOrCallback === 'function' ? dataOrCallback : maybeCallback;
+        const data = typeof dataOrCallback === 'object' ? dataOrCallback : {};
+        
+        if (typeof callback !== 'function') {
+            console.error('[ConferenceSocket] createTransport called without callback');
+            return;
+        }
+        
         try {
             let room;
             for (const r of rooms.values()) {
@@ -303,6 +322,8 @@ module.exports = async function init(io) {
             transport.on('dtlsstatechange', (dtlsState) => {
                 if (dtlsState === 'closed') transport.close();
             });
+
+            console.log(`[ConferenceSocket] Created ${data.consumer ? 'recv' : 'send'} transport: ${transport.id}`);
     
             callback({
                 transport: {
@@ -317,6 +338,7 @@ module.exports = async function init(io) {
                 dtlsParameters: transport.dtlsParameters
             });
         } catch (err) {
+            console.error('[ConferenceSocket] createTransport error:', err.message);
             callback({ error: err.message });
         }
     };
@@ -352,6 +374,8 @@ module.exports = async function init(io) {
 
     const produce = async ({ transportId, kind, rtpParameters }, callback) => {
         try {
+            console.log(`[ConferenceSocket] Produce request: kind=${kind}, transportId=${transportId}`);
+            
             let room;
             let roomId;
             for (const [rId, r] of rooms.entries()) {
@@ -378,15 +402,19 @@ module.exports = async function init(io) {
                 producer.close();
             });
 
+            console.log(`[ConferenceSocket] Producer created: ${producer.id} (${kind}) for user ${socket.userName}`);
+
             // Announce to others
-            socket.to(roomId).emit('sfu:new-producer', {
+            const announcementData = {
                 producerId: producer.id,
                 producerSocketId: socket.id,
                 socketId: socket.id,
                 userId: socket.userId,
                 kind: producer.kind,
                 appData: producer.appData
-            });
+            };
+            
+            socket.to(roomId).emit('sfu:new-producer', announcementData);
             
             // Legacy announce
             socket.to(roomId).emit('newProducer', {
@@ -395,8 +423,10 @@ module.exports = async function init(io) {
                 kind: producer.kind
             });
 
-            callback({ id: producer.id });
+            console.log(`[ConferenceSocket] Announced new producer to room ${roomId}`);
+            callback({ id: producer.id, producerId: producer.id }); // Support both id and producerId
         } catch (err) {
+            console.error('[ConferenceSocket] Produce error:', err.message);
             callback({ error: err.message });
         }
     };
