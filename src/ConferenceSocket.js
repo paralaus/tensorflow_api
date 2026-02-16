@@ -28,6 +28,11 @@ const ICE_SERVERS = [
       credential: process.env.TURN_SERVER_CREDENTIAL || 'turnpassword'
     },
     {
+      urls: process.env.TURN_SERVER_URL + '?transport=tcp',
+      username: process.env.TURN_SERVER_USERNAME || 'turnuser',
+      credential: process.env.TURN_SERVER_CREDENTIAL || 'turnpassword'
+    },
+    {
       urls: process.env.TURN_SERVER_URL.replace('turn:', 'turns:').replace(':3478', ':5349'),
       username: process.env.TURN_SERVER_USERNAME || 'turnuser',
       credential: process.env.TURN_SERVER_CREDENTIAL || 'turnpassword'
