@@ -461,6 +461,17 @@ function OIDCAuth(req, res, next) {
     }
 }
 
+function sanitizeMediaUrl(url) {
+    if (typeof url !== 'string') {
+        return url;
+    }
+    let result = url.trim();
+    if (result) {
+        result = result.replace(/^`+/, '').replace(/`+$/, '');
+    }
+    return result;
+}
+
 function startServer() {
     // uygulamayı başlat
     app.use(cors(corsOptions));
@@ -489,7 +500,10 @@ function startServer() {
 
     // HLS Conversion Route
     app.post('/hls/from-url', async (req, res) => {
-      const { url, channelId, messageId } = req.body || {};
+      const raw = (req.body && req.body.url) || null;
+      const url = sanitizeMediaUrl(raw);
+      const channelId = req.body && req.body.channelId;
+      const messageId = req.body && req.body.messageId;
 
       if (!url || typeof url !== 'string') {
         return res.status(400).json({ error: 'url_required' });
