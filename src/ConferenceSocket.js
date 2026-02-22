@@ -125,6 +125,7 @@ function getNextWorker() {
 }
 
 module.exports = async function init(io) {
+  console.log('[[[ CONFERENCE SOCKET INITIALIZED - DEBUG MODE V2 ACTIVE ]]]');
   const conferenceNsp = io.of('/conference');
 
   conferenceNsp.use((socket, next) => {
@@ -247,7 +248,8 @@ module.exports = async function init(io) {
       });
     });
 
-    socket.on('disconnect', () => {
+    socket.on('disconnect', (reason) => {
+      console.log(`[ConferenceSocket] User ${socket.userId} (${socket.userName}) disconnected from socket ${socket.id}. Reason: ${reason}`);
       rooms.forEach((room, roomId) => {
         if (room.peers.has(socket.id)) {
           // Notify others before cleaning up
@@ -347,8 +349,14 @@ module.exports = async function init(io) {
     socket.on('createWebRtcTransport', createTransport); // Legacy
     socket.on('sfu:create-recv-transport', createTransport);
 
-    const connectTransport = async ({ transportId, dtlsParameters }, callback) => {
+    const connectTransport = async (data, callback) => {
+        // DEBUG: Log entire data object to see what client is sending
+        console.log('[ConferenceSocket] connectTransport raw data:', JSON.stringify(data));
+        
+        const transportId = data.transportId || data.transport_id;
+        const dtlsParameters = data.dtlsParameters;
         try {
+            console.log(`[ConferenceSocket] connectTransport request: transportId=${transportId}`);
             let room;
             for (const r of rooms.values()) {
                 if (r.peers.has(socket.id)) {
@@ -359,10 +367,14 @@ module.exports = async function init(io) {
             if (!room) throw new Error('Not in room');
 
             const peer = room.peers.get(socket.id);
+            const availableTransportIds = peer.transports.map(t => t.id);
+            console.log(`[ConferenceSocket] Peer ${socket.id} connecting transport ${transportId}. Available: ${availableTransportIds.join(', ')}`);
+            
             const transport = peer.transports.find(t => t.id === transportId);
-            if (!transport) throw new Error('Transport not found');
+            if (!transport) throw new Error(`Server: Transport not found (connect) ID: ${transportId}`);
 
             await transport.connect({ dtlsParameters });
+            console.log(`[ConferenceSocket] Transport ${transportId} connected successfully`);
             callback({ connected: true });
         } catch (err) {
             callback({ error: err.message });
@@ -372,7 +384,9 @@ module.exports = async function init(io) {
     socket.on('sfu:connect-transport', connectTransport);
     socket.on('connectTransport', connectTransport); // Legacy
 
-    const produce = async ({ transportId, kind, rtpParameters }, callback) => {
+    const produce = async (data, callback) => {
+        const transportId = data.transportId || data.producerTransportId;
+        const { kind, rtpParameters, appData } = data;
         try {
             console.log(`[ConferenceSocket] Produce request: kind=${kind}, transportId=${transportId}`);
             
@@ -388,8 +402,14 @@ module.exports = async function init(io) {
             if (!room) throw new Error('Not in room');
 
             const peer = room.peers.get(socket.id);
+            const availableTransportIds = peer.transports.map(t => t.id);
+            console.log(`[ConferenceSocket] Peer ${socket.id} (User: ${socket.userId}) has transports: ${availableTransportIds.join(', ')}`);
+
             const transport = peer.transports.find(t => t.id === transportId);
-            if (!transport) throw new Error('Transport not found');
+            if (!transport) {
+                console.error(`[ConferenceSocket] CRITICAL: Transport ${transportId} not found! Available: ${availableTransportIds.join(', ')}`);
+                throw new Error(`Server: Transport not found (produce) ID: ${transportId}`);
+            }
 
             const producer = await transport.produce({ 
                 kind, 
@@ -400,6 +420,16 @@ module.exports = async function init(io) {
 
             producer.on('transportclose', () => {
                 producer.close();
+            });
+
+            // Handle score event
+            producer.on('score', (score) => {
+                // socket.emit('producerScore', { producerId: producer.id, score });
+            });
+            
+            // Handle video orientation change
+            producer.on('videoorientationchange', (videoOrientation) => {
+                 console.log(`[ConferenceSocket] Producer ${producer.id} video orientation change:`, videoOrientation);
             });
 
             console.log(`[ConferenceSocket] Producer created: ${producer.id} (${kind}) for user ${socket.userName}`);

@@ -106,9 +106,14 @@ const mediasoupConfig = {
   router: {
     mediaCodecs: [
       { kind: 'audio', mimeType: 'audio/opus', clockRate: 48000, channels: 2 },
+      // VP8 (Genel uyumluluk için)
       { kind: 'video', mimeType: 'video/VP8', clockRate: 90000, parameters: { 'x-google-start-bitrate': 1000 } },
-      { kind: 'video', mimeType: 'video/VP9', clockRate: 90000, parameters: { 'profile-id': 2, 'x-google-start-bitrate': 1000 } },
-      { kind: 'video', mimeType: 'video/H264', clockRate: 90000, parameters: { 'packetization-mode': 1, 'profile-level-id': '4d0032', 'level-asymmetry-allowed': 1, 'x-google-start-bitrate': 1000 } },
+      // H264 Constrained Baseline Profile Level 3.1 (Packetization Mode 1)
+      { kind: 'video', mimeType: 'video/H264', clockRate: 90000, parameters: { 'packetization-mode': 1, 'profile-level-id': '42e01f', 'level-asymmetry-allowed': 1, 'x-google-start-bitrate': 1000 } },
+      // H264 Constrained Baseline Profile Level 3.1 (Packetization Mode 0 - Bazı eski Androidler için)
+      { kind: 'video', mimeType: 'video/H264', clockRate: 90000, parameters: { 'packetization-mode': 0, 'profile-level-id': '42e01f', 'level-asymmetry-allowed': 1, 'x-google-start-bitrate': 1000 } },
+      // H264 Main Profile Level 3.1
+      { kind: 'video', mimeType: 'video/H264', clockRate: 90000, parameters: { 'packetization-mode': 1, 'profile-level-id': '4d001f', 'level-asymmetry-allowed': 1, 'x-google-start-bitrate': 1000 } }
     ],
   },
   webRtcTransport: {
@@ -212,7 +217,7 @@ conferenceNsp.on('connection', (socket) => {
     
     room.peers.set(socket.id, { transports: [], producers: [], consumers: [] });
 
-    console.log(`User joined room ${roomId}: ${socket.userName} (Admin: ${socket.isAdmin})`);
+    console.log(`[MediaServer] User joined room ${roomId}: ${socket.userName} (Socket: ${socket.id})`);
 
     // Send SFU mode confirmation (Always SFU in this service)
     const responseData = {
@@ -237,6 +242,7 @@ conferenceNsp.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
+    console.log(`[MediaServer] Socket disconnected: ${socket.id}`);
     // Cleanup
     rooms.forEach((room, roomId) => {
       if (room.peers.has(socket.id)) {
@@ -480,6 +486,8 @@ conferenceNsp.on('connection', (socket) => {
         transport.on('dtlsstatechange', (dtlsState) => {
             if (dtlsState === 'closed') transport.close();
         });
+
+        console.log(`[MediaServer] Created WebRtcTransport: ${transport.id} for socket: ${socket.id}`);
 
         callback({
             id: transport.id,
