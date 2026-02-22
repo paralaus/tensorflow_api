@@ -196,7 +196,11 @@ module.exports = async function init(io) {
       } else {
         const worker = getNextWorker();
         router = await worker.createRouter({ mediaCodecs: mediasoupConfig.router.mediaCodecs });
-        rooms.set(roomId, { router, peers: new Map() });
+        rooms.set(roomId, { 
+          router, 
+          peers: new Map(),
+          polls: []
+        });
         console.log(`[ConferenceSocket] Created router for room ${roomId}`);
       }
 
@@ -225,6 +229,7 @@ module.exports = async function init(io) {
         mode: 'sfu',
         isAdmin: socket.isAdmin,
         iceServers: ICE_SERVERS, // CRITICAL: Send ICE servers including TURN for NAT traversal
+        polls: room.polls || [],
         participants: Array.from(room.peers.values()).map(p => ({
             socketId: p.socketId,
             userId: p.userId,
@@ -625,6 +630,198 @@ module.exports = async function init(io) {
             socket.emit('newProducers', producers);
         }
     });
+
+    // --- Chat and Interaction Handlers ---
+
+    socket.on('chat-message', (data) => {
+        let room;
+        let roomId;
+        for (const [rId, r] of rooms.entries()) {
+            if (r.peers.has(socket.id)) {
+                room = r;
+                roomId = rId;
+                break;
+            }
+        }
+        if (!room) return;
+
+        console.log(`[ConferenceSocket] Chat message from ${socket.userName}: ${data.content}`);
+        
+        const messageData = {
+            ...data,
+            id: Date.now(),
+            userId: socket.userId,
+            userName: socket.userName,
+            userAvatar: socket.userAvatar,
+            timestamp: new Date().toISOString(),
+            odaId: socket.userId // Ensure odaId is present for client matching
+        };
+
+        // Broadcast to everyone in the room (including sender for confirmation if needed, but usually sender handles optimistic UI)
+        // Using conferenceNsp.to(roomId) sends to everyone including sender within the namespace
+        conferenceNsp.to(roomId).emit('chat-message', messageData);
+    });
+
+    socket.on('hand-raise', (data) => {
+        let room;
+        let roomId;
+        for (const [rId, r] of rooms.entries()) {
+            if (r.peers.has(socket.id)) {
+                room = r;
+                roomId = rId;
+                break;
+            }
+        }
+        if (!room) return;
+
+        console.log(`[ConferenceSocket] Hand raise update from ${socket.userName}: ${data.raised}`);
+        
+        conferenceNsp.to(roomId).emit('hand-raise-update', {
+            userId: socket.userId,
+            socketId: socket.id,
+            raised: data.raised,
+            userName: socket.userName
+        });
+    });
+
+    socket.on('reaction', (data) => {
+        let room;
+        let roomId;
+        for (const [rId, r] of rooms.entries()) {
+            if (r.peers.has(socket.id)) {
+                room = r;
+                roomId = rId;
+                break;
+            }
+        }
+        if (!room) return;
+
+        conferenceNsp.to(roomId).emit('user-reaction', {
+            userId: socket.userId,
+            userName: socket.userName,
+            emoji: data.emoji
+        });
+    });
+
+    socket.on('toggle-audio', (data) => {
+        let room;
+        let roomId;
+        for (const [rId, r] of rooms.entries()) {
+            if (r.peers.has(socket.id)) {
+                room = r;
+                roomId = rId;
+                break;
+            }
+        }
+        if (!room) return;
+
+        console.log(`[ConferenceSocket] Audio toggle ${socket.userName}: ${data.enabled}`);
+        socket.to(roomId).emit('user-audio-toggle', {
+            userId: socket.userId,
+            socketId: socket.id,
+            enabled: data.enabled
+        });
+    });
+
+    socket.on('toggle-video', (data) => {
+        let room;
+        let roomId;
+        for (const [rId, r] of rooms.entries()) {
+            if (r.peers.has(socket.id)) {
+                room = r;
+                roomId = rId;
+                break;
+            }
+        }
+        if (!room) return;
+
+        console.log(`[ConferenceSocket] Video toggle ${socket.userName}: ${data.enabled}`);
+        socket.to(roomId).emit('user-video-toggle', {
+            userId: socket.userId,
+            socketId: socket.id,
+            enabled: data.enabled
+        });
+    });
+
+    // --- Poll Handlers ---
+    socket.on('poll-created', (pollData) => {
+        let room;
+        let roomId;
+        for (const [rId, r] of rooms.entries()) {
+            if (r.peers.has(socket.id)) {
+                room = r;
+                roomId = rId;
+                break;
+            }
+        }
+        if (!room) return;
+
+        if (!socket.isAdmin) {
+            console.warn(`[ConferenceSocket] Unauthorized poll creation attempt by ${socket.userName}`);
+            return;
+        }
+
+        const newPoll = {
+            ...pollData,
+            id: Date.now().toString(),
+            createdBy: socket.userId,
+            createdAt: new Date().toISOString(),
+            status: 'active',
+            votes: {}
+        };
+
+        if (!room.polls) room.polls = [];
+        room.polls.push(newPoll);
+
+        console.log(`[ConferenceSocket] Poll created in room ${roomId}: ${newPoll.question}`);
+        conferenceNsp.to(roomId).emit('poll-created', newPoll);
+    });
+
+    socket.on('poll-vote', ({ pollId, optionIndex }) => {
+        let room;
+        let roomId;
+        for (const [rId, r] of rooms.entries()) {
+            if (r.peers.has(socket.id)) {
+                room = r;
+                roomId = rId;
+                break;
+            }
+        }
+        if (!room || !room.polls) return;
+
+        const poll = room.polls.find(p => p.id === pollId);
+        if (!poll) return;
+
+        if (poll.status !== 'active') return;
+
+        poll.votes[socket.userId] = optionIndex;
+
+        console.log(`[ConferenceSocket] Vote in room ${roomId} for poll ${pollId} by ${socket.userName}`);
+        conferenceNsp.to(roomId).emit('poll-updated', poll);
+    });
+
+    socket.on('poll-closed', ({ pollId }) => {
+        let room;
+        let roomId;
+        for (const [rId, r] of rooms.entries()) {
+            if (r.peers.has(socket.id)) {
+                room = r;
+                roomId = rId;
+                break;
+            }
+        }
+        if (!room || !room.polls) return;
+
+        if (!socket.isAdmin) return;
+
+        const poll = room.polls.find(p => p.id === pollId);
+        if (!poll) return;
+
+        poll.status = 'closed';
+        console.log(`[ConferenceSocket] Poll closed in room ${roomId}: ${pollId}`);
+        conferenceNsp.to(roomId).emit('poll-updated', poll);
+    });
+
   });
 
   // Initialize workers
