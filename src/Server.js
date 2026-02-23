@@ -273,8 +273,11 @@ const corsOptions = {
 const httpsServer = https.createServer(options, app);
 const io = require('socket.io')(httpsServer, {
     maxHttpBufferSize: 1e7,
-    transports: ['websocket'],
+    transports: ['websocket', 'polling'], // Allow polling fallback for mobile
     cors: corsOptions,
+    pingTimeout: 60000, // 60 seconds before considering connection dead
+    pingInterval: 25000, // Send ping every 25 seconds to keep connection alive
+    connectTimeout: 45000, // 45 seconds to establish connection
 });
 
 // Initialize Conference Namespace (for Admin and Mobile App compatibility)

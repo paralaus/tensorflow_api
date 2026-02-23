@@ -327,7 +327,16 @@ module.exports = async function init(io) {
             peer.transports.push(transport);
     
             transport.on('dtlsstatechange', (dtlsState) => {
+                console.log(`[ConferenceSocket] Transport ${transport.id} DTLS state: ${dtlsState}`);
                 if (dtlsState === 'closed') transport.close();
+            });
+            
+            transport.on('icestatechange', (iceState) => {
+                console.log(`[ConferenceSocket] Transport ${transport.id} ICE state: ${iceState}`);
+            });
+            
+            transport.on('iceselectedtuplechange', (tuple) => {
+                console.log(`[ConferenceSocket] Transport ${transport.id} ICE selected tuple:`, JSON.stringify(tuple));
             });
 
             console.log(`[ConferenceSocket] Created ${data.consumer ? 'recv' : 'send'} transport: ${transport.id}`);
@@ -427,9 +436,10 @@ module.exports = async function init(io) {
                 producer.close();
             });
 
-            // Handle score event
+            // Handle score event - CRITICAL for debugging RTP flow
             producer.on('score', (score) => {
-                // socket.emit('producerScore', { producerId: producer.id, score });
+                console.log(`[ConferenceSocket] Producer ${producer.id} (${kind}) score:`, JSON.stringify(score));
+                socket.emit('producerScore', { producerId: producer.id, score });
             });
             
             // Handle video orientation change
@@ -471,6 +481,8 @@ module.exports = async function init(io) {
 
     const consume = async ({ producerId, rtpCapabilities, transportId, consumerTransportId }, callback) => {
         try {
+            console.log(`[ConferenceSocket] Consume request from ${socket.userName}: producerId=${producerId}, transportId=${transportId || consumerTransportId}`);
+            
             let room;
             for (const r of rooms.values()) {
                 if (r.peers.has(socket.id)) {
@@ -482,13 +494,17 @@ module.exports = async function init(io) {
 
             const roomRouter = room.router;
             if (!roomRouter.canConsume({ producerId, rtpCapabilities })) {
+                console.warn(`[ConferenceSocket] Cannot consume: canConsume returned false for ${socket.userName}`);
                 return callback({ error: 'Cannot consume' });
             }
 
             const peer = room.peers.get(socket.id);
             const tId = transportId || consumerTransportId;
             const transport = peer.transports.find(t => t.id === tId);
-            if (!transport) throw new Error('Transport not found');
+            if (!transport) {
+                console.error(`[ConferenceSocket] Transport not found: ${tId}. Available: ${peer.transports.map(t => t.id).join(', ')}`);
+                throw new Error('Transport not found');
+            }
 
             const consumer = await transport.consume({
                 producerId,
@@ -497,6 +513,7 @@ module.exports = async function init(io) {
             });
 
             peer.consumers.push(consumer);
+            console.log(`[ConferenceSocket] Consumer created: ${consumer.id} (${consumer.kind}) for ${socket.userName}`);
 
             consumer.on('transportclose', () => {
                 consumer.close();
@@ -506,6 +523,16 @@ module.exports = async function init(io) {
                 consumer.close();
                 socket.emit('consumer-closed', { consumerId: consumer.id });
                 socket.emit('consumerClosed', { consumer_id: consumer.id, consumer_kind: consumer.kind });
+            });
+            
+            // CRITICAL: Monitor consumer score to verify RTP flow
+            consumer.on('score', (score) => {
+                console.log(`[ConferenceSocket] Consumer ${consumer.id} (${consumer.kind}) score:`, JSON.stringify(score));
+            });
+            
+            // Log consumer layers change
+            consumer.on('layerschange', (layers) => {
+                console.log(`[ConferenceSocket] Consumer ${consumer.id} layers change:`, JSON.stringify(layers));
             });
 
             callback({
@@ -537,9 +564,14 @@ module.exports = async function init(io) {
             
             const peer = room.peers.get(socket.id);
             const consumer = peer.consumers.find(c => c.id === consumerId);
-            if (!consumer) throw new Error('Consumer not found');
+            if (!consumer) {
+                console.error(`[ConferenceSocket] resumeConsumer: Consumer ${consumerId} not found for ${socket.userName}`);
+                throw new Error('Consumer not found');
+            }
             
+            console.log(`[ConferenceSocket] Resuming consumer ${consumerId} (${consumer.kind}) for ${socket.userName}, paused=${consumer.paused}`);
             await consumer.resume();
+            console.log(`[ConferenceSocket] Consumer ${consumerId} resumed successfully, paused=${consumer.paused}`);
             if (typeof callback === 'function') callback({ resumed: true });
         } catch(err) {
             if (typeof callback === 'function') callback({ error: err.message });
