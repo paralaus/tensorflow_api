@@ -7,6 +7,7 @@ dotenv.config();
 
 // Configuration
 const JWT_SECRET = process.env.JWT_SECRET || (config.jwt && config.jwt.key) || 'saigm_video_chat_sfu_jwt_secret';
+const JWT_SECRETS_ENV = process.env.JWT_SECRETS || process.env.JWT_SECRETS_LIST || '';
 const MEDIASOUP_MIN_PORT = parseInt(process.env.MEDIASOUP_MIN_PORT) || 40000; // Safe range
 const MEDIASOUP_MAX_PORT = parseInt(process.env.MEDIASOUP_MAX_PORT) || 40100;
 const MEDIASOUP_LISTEN_IP = process.env.MEDIASOUP_LISTEN_IP || '0.0.0.0';
@@ -129,7 +130,14 @@ module.exports = async function init(io) {
   const conferenceNsp = io.of('/conference');
 
   conferenceNsp.use((socket, next) => {
-    const token = socket.handshake.auth.token || socket.handshake.headers.authorization?.split(' ')[1];
+    let token =
+      socket.handshake.auth?.token ||
+      socket.handshake.headers.authorization?.split(' ')[1] ||
+      socket.handshake.query?.token;
+
+    if (typeof token === 'string' && token.startsWith('Bearer ')) {
+      token = token.slice('Bearer '.length);
+    }
     // Allow unauthenticated for now if token missing? No, strict.
     if (!token) {
         console.warn('[ConferenceSocket] Missing token');
@@ -138,13 +146,20 @@ module.exports = async function init(io) {
 
     // Try to verify with multiple secrets to handle dev/prod mismatches
     let decoded = null;
-    const secrets = [
+    const extraSecrets = String(JWT_SECRETS_ENV)
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    const secrets = Array.from(new Set([
         process.env.JWT_SECRET,
+        JWT_SECRET,
         config.jwt && config.jwt.key,
+        ...extraSecrets,
         'saigm_video_chat_sfu_jwt_secret',
         'saigmvideochatsfu_jwt_secret',
         'thisisasamplesecret'
-    ].filter(Boolean); // Remove null/undefined
+    ].filter(Boolean))); // Remove null/undefined + dedupe
 
     for (const secret of secrets) {
         try {
