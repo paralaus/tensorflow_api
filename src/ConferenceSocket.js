@@ -129,6 +129,47 @@ module.exports = async function init(io) {
   console.log('[[[ CONFERENCE SOCKET INITIALIZED - DEBUG MODE V2 ACTIVE ]]]');
   const conferenceNsp = io.of('/conference');
 
+  const shouldLogConsumerScores = String(process.env.DEBUG_CONSUMER_SCORES || '').trim() === '1';
+
+  function cleanupPeerFromRoom(room, roomId, socket) {
+    try {
+      const peer = room.peers.get(socket.id);
+      if (!peer) return;
+
+      try {
+        socket.leave(roomId);
+      } catch (e) {}
+
+      try {
+        (peer.consumers || []).forEach((c) => {
+          try { c.close(); } catch (e) {}
+        });
+      } catch (e) {}
+
+      try {
+        (peer.producers || []).forEach((p) => {
+          try { p.close(); } catch (e) {}
+        });
+      } catch (e) {}
+
+      try {
+        (peer.transports || []).forEach((t) => {
+          try { t.close(); } catch (e) {}
+        });
+      } catch (e) {}
+
+      room.peers.delete(socket.id);
+
+      if (room.peers.size === 0) {
+        try { room.router.close(); } catch (e) {}
+        rooms.delete(roomId);
+        console.log(`[ConferenceSocket] Room ${roomId} closed`);
+      }
+    } catch (e) {
+      console.error('[ConferenceSocket] cleanupPeerFromRoom error:', e?.message || e);
+    }
+  }
+
   conferenceNsp.use((socket, next) => {
     let token =
       socket.handshake.auth?.token ||
@@ -277,18 +318,33 @@ module.exports = async function init(io) {
               socketId: socket.id,
               userId: socket.userId
           });
-
-          const peer = room.peers.get(socket.id);
-          peer.transports.forEach(t => t.close());
-          room.peers.delete(socket.id);
-          
-          if (room.peers.size === 0) {
-            room.router.close();
-            rooms.delete(roomId);
-            console.log(`[ConferenceSocket] Room ${roomId} closed`);
-          }
+          cleanupPeerFromRoom(room, roomId, socket);
         }
       });
+    });
+
+    socket.on('leave-room', ({ roomId } = {}, callback) => {
+      try {
+        if (roomId && rooms.has(roomId) && rooms.get(roomId).peers.has(socket.id)) {
+          socket.to(roomId).emit('user-left', { socketId: socket.id, userId: socket.userId });
+          cleanupPeerFromRoom(rooms.get(roomId), roomId, socket);
+          if (typeof callback === 'function') callback({ left: true });
+          return;
+        }
+
+        for (const [rid, room] of rooms.entries()) {
+          if (room.peers.has(socket.id)) {
+            socket.to(rid).emit('user-left', { socketId: socket.id, userId: socket.userId });
+            cleanupPeerFromRoom(room, rid, socket);
+            if (typeof callback === 'function') callback({ left: true, roomId: rid });
+            return;
+          }
+        }
+
+        if (typeof callback === 'function') callback({ left: false });
+      } catch (e) {
+        if (typeof callback === 'function') callback({ error: e?.message || String(e) });
+      }
     });
 
     // SFU Handlers
@@ -542,7 +598,9 @@ module.exports = async function init(io) {
             
             // CRITICAL: Monitor consumer score to verify RTP flow
             consumer.on('score', (score) => {
-                console.log(`[ConferenceSocket] Consumer ${consumer.id} (${consumer.kind}) score:`, JSON.stringify(score));
+                if (shouldLogConsumerScores) {
+                  console.log(`[ConferenceSocket] Consumer ${consumer.id} (${consumer.kind}) score:`, JSON.stringify(score));
+                }
             });
             
             // Log consumer layers change
