@@ -824,6 +824,11 @@ module.exports = async function init(io) {
         const enabled = !!data?.enabled;
         const isMuted = data?.isMuted != null ? !!data.isMuted : !enabled;
 
+        try {
+            const audioProducerCount = (peer.producers || []).filter((p) => p.kind === 'audio').length;
+            console.log(`[ConferenceSocket] handleAudioToggle room=${roomId} userId=${socket.userId} isMuted=${isMuted} audioProducers=${audioProducerCount}`);
+        } catch (e) {}
+
         if (peer.producers && peer.producers.length) {
             const ops = [];
             for (const producer of peer.producers) {
@@ -832,6 +837,12 @@ module.exports = async function init(io) {
             }
             if (ops.length) await Promise.allSettled(ops);
         }
+
+        socket.emit('conference:toggleAudioAck', {
+            roomId,
+            userId: socket.userId,
+            isMuted
+        });
 
         socket.to(roomId).emit('conference:audioToggle', {
             userId: socket.userId,
@@ -851,6 +862,11 @@ module.exports = async function init(io) {
         const enabled = !!data?.enabled;
         const isVideoOff = data?.isVideoOff != null ? !!data.isVideoOff : !enabled;
 
+        try {
+            const videoProducerCount = (peer.producers || []).filter((p) => p.kind === 'video').length;
+            console.log(`[ConferenceSocket] handleVideoToggle room=${roomId} userId=${socket.userId} isVideoOff=${isVideoOff} videoProducers=${videoProducerCount}`);
+        } catch (e) {}
+
         if (peer.producers && peer.producers.length) {
             const ops = [];
             for (const producer of peer.producers) {
@@ -859,6 +875,12 @@ module.exports = async function init(io) {
             }
             if (ops.length) await Promise.allSettled(ops);
         }
+
+        socket.emit('conference:toggleVideoAck', {
+            roomId,
+            userId: socket.userId,
+            isVideoOff
+        });
 
         socket.to(roomId).emit('conference:videoToggle', {
             userId: socket.userId,
@@ -882,10 +904,12 @@ module.exports = async function init(io) {
     });
 
     socket.on('conference:toggleAudio', (data) => {
+        console.log(`[ConferenceSocket] conference:toggleAudio ${socket.userName}: isMuted=${data?.isMuted} enabled=${data?.enabled}`);
         handleAudioToggle(data).catch(() => {});
     });
 
     socket.on('conference:toggleVideo', (data) => {
+        console.log(`[ConferenceSocket] conference:toggleVideo ${socket.userName}: isVideoOff=${data?.isVideoOff} enabled=${data?.enabled}`);
         handleVideoToggle(data).catch(() => {});
     });
 
