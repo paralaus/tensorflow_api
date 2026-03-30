@@ -645,6 +645,11 @@ module.exports = async function init(io) {
             console.log(`[ConferenceSocket] Resuming consumer ${consumerId} (${consumer.kind}) for ${socket.userName}, paused=${consumer.paused}`);
             await consumer.resume();
             console.log(`[ConferenceSocket] Consumer ${consumerId} resumed successfully, paused=${consumer.paused}`);
+            if (consumer.kind === 'video' && typeof consumer.requestKeyFrame === 'function') {
+                try {
+                    await consumer.requestKeyFrame();
+                } catch (e) {}
+            }
             if (typeof callback === 'function') callback({ resumed: true });
         } catch(err) {
             if (typeof callback === 'function') callback({ error: err.message });
@@ -874,6 +879,17 @@ module.exports = async function init(io) {
                 ops.push(isVideoOff ? producer.pause() : producer.resume());
             }
             if (ops.length) await Promise.allSettled(ops);
+        }
+
+        if (!isVideoOff && peer.producers && peer.producers.length) {
+            const keyframeOps = [];
+            for (const producer of peer.producers) {
+                if (producer.kind !== 'video') continue;
+                if (typeof producer.requestKeyFrame === 'function') {
+                    keyframeOps.push(producer.requestKeyFrame());
+                }
+            }
+            if (keyframeOps.length) await Promise.allSettled(keyframeOps);
         }
 
         socket.emit('conference:toggleVideoAck', {
