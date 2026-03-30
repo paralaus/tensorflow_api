@@ -808,44 +808,85 @@ module.exports = async function init(io) {
         });
     });
 
-    socket.on('toggle-audio', (data) => {
-        let room;
-        let roomId;
+    const findRoomAndPeer = () => {
         for (const [rId, r] of rooms.entries()) {
             if (r.peers.has(socket.id)) {
-                room = r;
-                roomId = rId;
-                break;
+                return { roomId: rId, room: r, peer: r.peers.get(socket.id) };
             }
         }
-        if (!room) return;
+        return { roomId: null, room: null, peer: null };
+    };
 
-        console.log(`[ConferenceSocket] Audio toggle ${socket.userName}: ${data.enabled}`);
+    const handleAudioToggle = async (data) => {
+        const { roomId, room, peer } = findRoomAndPeer();
+        if (!room || !roomId || !peer) return;
+
+        const enabled = !!data?.enabled;
+        const isMuted = data?.isMuted != null ? !!data.isMuted : !enabled;
+
+        if (peer.producers && peer.producers.length) {
+            const ops = [];
+            for (const producer of peer.producers) {
+                if (producer.kind !== 'audio') continue;
+                ops.push(isMuted ? producer.pause() : producer.resume());
+            }
+            if (ops.length) await Promise.allSettled(ops);
+        }
+
+        socket.to(roomId).emit('conference:audioToggle', {
+            userId: socket.userId,
+            isMuted
+        });
         socket.to(roomId).emit('user-audio-toggle', {
             userId: socket.userId,
             socketId: socket.id,
-            enabled: data.enabled
+            enabled: !isMuted
         });
-    });
+    };
 
-    socket.on('toggle-video', (data) => {
-        let room;
-        let roomId;
-        for (const [rId, r] of rooms.entries()) {
-            if (r.peers.has(socket.id)) {
-                room = r;
-                roomId = rId;
-                break;
+    const handleVideoToggle = async (data) => {
+        const { roomId, room, peer } = findRoomAndPeer();
+        if (!room || !roomId || !peer) return;
+
+        const enabled = !!data?.enabled;
+        const isVideoOff = data?.isVideoOff != null ? !!data.isVideoOff : !enabled;
+
+        if (peer.producers && peer.producers.length) {
+            const ops = [];
+            for (const producer of peer.producers) {
+                if (producer.kind !== 'video') continue;
+                ops.push(isVideoOff ? producer.pause() : producer.resume());
             }
+            if (ops.length) await Promise.allSettled(ops);
         }
-        if (!room) return;
 
-        console.log(`[ConferenceSocket] Video toggle ${socket.userName}: ${data.enabled}`);
+        socket.to(roomId).emit('conference:videoToggle', {
+            userId: socket.userId,
+            isVideoOff
+        });
         socket.to(roomId).emit('user-video-toggle', {
             userId: socket.userId,
             socketId: socket.id,
-            enabled: data.enabled
+            enabled: !isVideoOff
         });
+    };
+
+    socket.on('toggle-audio', (data) => {
+        console.log(`[ConferenceSocket] Audio toggle ${socket.userName}: ${data.enabled}`);
+        handleAudioToggle(data).catch(() => {});
+    });
+
+    socket.on('toggle-video', (data) => {
+        console.log(`[ConferenceSocket] Video toggle ${socket.userName}: ${data.enabled}`);
+        handleVideoToggle(data).catch(() => {});
+    });
+
+    socket.on('conference:toggleAudio', (data) => {
+        handleAudioToggle(data).catch(() => {});
+    });
+
+    socket.on('conference:toggleVideo', (data) => {
+        handleVideoToggle(data).catch(() => {});
     });
 
     // --- Poll Handlers ---
