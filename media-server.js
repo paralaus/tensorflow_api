@@ -672,16 +672,41 @@ conferenceNsp.on('connection', (socket) => {
     });
   });
 
-  socket.on('message-reaction', ({ messageId, emoji }) => {
+  const handleMessageReaction = (eventName, payload = {}) => {
     const roomId = socketRoomMap.get(socket.id);
-    if (!roomId || !messageId || !emoji) return;
-    conferenceNsp.to(roomId).emit('message-reaction', {
-      messageId: String(messageId),
-      emoji: String(emoji),
+    const messageId = String(payload?.messageId || payload?.message_id || payload?.msgId || '');
+    const emoji = String(payload?.emoji || '');
+    console.log(
+      `[ConferenceSocket] message reaction received (${eventName}) from ${socket.userName}: room=${roomId || 'none'}, messageId=${messageId || 'missing'}, emoji=${emoji || 'missing'}`
+    );
+    if (!roomId || !messageId || !emoji) {
+      console.warn(
+        `[ConferenceSocket] message reaction ignored (${eventName}) for ${socket.userName}: invalid payload ${JSON.stringify(payload)}`
+      );
+      return;
+    }
+    const reactionPayload = {
+      messageId,
+      message_id: messageId,
+      msgId: messageId,
+      emoji,
       userId: socket.userId,
       odaId: socket.userId,
       userName: socket.userName,
-    });
+    };
+    conferenceNsp.to(roomId).emit('message-reaction', reactionPayload);
+    conferenceNsp.to(roomId).emit('messageReaction', reactionPayload);
+    console.log(
+      `[ConferenceSocket] message reaction broadcast in room ${roomId}: user=${socket.userName}, messageId=${messageId}, emoji=${emoji}`
+    );
+  };
+
+  socket.on('message-reaction', (payload) => {
+    handleMessageReaction('message-reaction', payload);
+  });
+
+  socket.on('messageReaction', (payload) => {
+    handleMessageReaction('messageReaction', payload);
   });
 
   socket.on('reaction', ({ emoji }) => {
