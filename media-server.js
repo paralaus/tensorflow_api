@@ -130,6 +130,8 @@ const mediasoupConfig = {
 let workers = [];
 let nextWorkerIndex = 0;
 const rooms = new Map(); // roomId -> { router, peers: Map<socketId, { transports, producers, consumers }> }
+const socketRoomMap = new Map(); // socketId -> roomId
+const typingUsersByRoom = new Map(); // roomId -> Set<userId>
 
 // Initialize Mediasoup Workers
 async function runMediasoupWorkers() {
@@ -196,6 +198,7 @@ conferenceNsp.on('connection', (socket) => {
     }
 
     socket.join(roomId);
+    socketRoomMap.set(socket.id, roomId);
     
     // Create/Get Router
     let router;
@@ -243,6 +246,21 @@ conferenceNsp.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     console.log(`[MediaServer] Socket disconnected: ${socket.id}`);
+    const leftRoomId = socketRoomMap.get(socket.id);
+    if (leftRoomId) {
+      socket.to(leftRoomId).emit('user-left', {
+        socketId: socket.id,
+        userId: socket.userId,
+      });
+      socketRoomMap.delete(socket.id);
+      if (typingUsersByRoom.has(leftRoomId)) {
+        const nextTypingUsers = typingUsersByRoom.get(leftRoomId);
+        nextTypingUsers.delete(socket.userId);
+        conferenceNsp.to(leftRoomId).emit('typing-users', {
+          users: Array.from(nextTypingUsers),
+        });
+      }
+    }
     // Cleanup
     rooms.forEach((room, roomId) => {
       if (room.peers.has(socket.id)) {
@@ -634,11 +652,84 @@ conferenceNsp.on('connection', (socket) => {
       socket.to(data.to).emit('ice-candidate', { ...data, from: socket.id });
   });
   
-  // Also handle legacy signaling for chat/etc if needed, 
-  // but preferably keep that in main backend? 
-  // Actually, chat messages might be easier here if we want them in the same socket connection.
-  // But for now, let's assume chat goes through main backend or we duplicate the logic.
-  // For now, only media logic.
+  // --- Chat / Reactions / Typing (vizyo clients use same namespace) ---
+  socket.on('chat-message', ({ id, content, type, file, replyTo, mentions, timestamp }) => {
+    const roomId = socketRoomMap.get(socket.id);
+    if (!roomId) return;
+    const messageId = String(id || `${Date.now()}-${socket.userId}-${String(content || file?.name || '').slice(0, 24)}`);
+    conferenceNsp.to(roomId).emit('chat-message', {
+      id: messageId,
+      userId: socket.userId,
+      odaId: socket.userId,
+      userName: socket.userName,
+      userAvatar: socket.userAvatar,
+      content: String(content || ''),
+      type: type || 'text',
+      file,
+      replyTo,
+      mentions,
+      timestamp: timestamp || Date.now(),
+    });
+  });
+
+  socket.on('message-reaction', ({ messageId, emoji }) => {
+    const roomId = socketRoomMap.get(socket.id);
+    if (!roomId || !messageId || !emoji) return;
+    conferenceNsp.to(roomId).emit('message-reaction', {
+      messageId: String(messageId),
+      emoji: String(emoji),
+      userId: socket.userId,
+      odaId: socket.userId,
+      userName: socket.userName,
+    });
+  });
+
+  socket.on('reaction', ({ emoji }) => {
+    const roomId = socketRoomMap.get(socket.id);
+    if (!roomId || !emoji) return;
+    conferenceNsp.to(roomId).emit('user-reaction', {
+      emoji: String(emoji),
+      userId: socket.userId,
+      userName: socket.userName,
+    });
+  });
+
+  socket.on('typing-start', () => {
+    const roomId = socketRoomMap.get(socket.id);
+    if (!roomId) return;
+    if (!typingUsersByRoom.has(roomId)) {
+      typingUsersByRoom.set(roomId, new Set());
+    }
+    const typingSet = typingUsersByRoom.get(roomId);
+    typingSet.add(socket.userName || socket.userId);
+    conferenceNsp.to(roomId).emit('typing-users', { users: Array.from(typingSet) });
+  });
+
+  socket.on('typing-stop', () => {
+    const roomId = socketRoomMap.get(socket.id);
+    if (!roomId || !typingUsersByRoom.has(roomId)) return;
+    const typingSet = typingUsersByRoom.get(roomId);
+    typingSet.delete(socket.userName || socket.userId);
+    conferenceNsp.to(roomId).emit('typing-users', { users: Array.from(typingSet) });
+  });
+
+  socket.on('file-share', ({ fileName, fileUrl, fileType, fileSize }) => {
+    const roomId = socketRoomMap.get(socket.id);
+    if (!roomId) return;
+    const messageId = `${Date.now()}-${socket.userId}-${String(fileName || 'file').slice(0, 24)}`;
+    conferenceNsp.to(roomId).emit('file-shared', {
+      id: messageId,
+      userId: socket.userId,
+      odaId: socket.userId,
+      userName: socket.userName,
+      userAvatar: socket.userAvatar,
+      fileName,
+      fileUrl,
+      fileType,
+      fileSize,
+      timestamp: Date.now(),
+    });
+  });
 });
 
 function ensureDirectory(dirPath) {
