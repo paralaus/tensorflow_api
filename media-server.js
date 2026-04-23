@@ -132,6 +132,7 @@ let nextWorkerIndex = 0;
 const rooms = new Map(); // roomId -> { router, peers: Map<socketId, { transports, producers, consumers }> }
 const socketRoomMap = new Map(); // socketId -> roomId
 const typingUsersByRoom = new Map(); // roomId -> Set<userId>
+const roomHostByRoom = new Map(); // roomId -> host userId (first joiner fallback)
 
 // Initialize Mediasoup Workers
 async function runMediasoupWorkers() {
@@ -186,6 +187,41 @@ conferenceNsp.use((socket, next) => {
 conferenceNsp.on('connection', (socket) => {
   console.log(`User connected: ${socket.userId} (${socket.userName}) [Admin: ${socket.isAdmin}]`);
 
+  const normalizeAlias = (value) => {
+    const text = String(value || '').trim();
+    return text.startsWith('sfu-') ? text.slice(4) : text;
+  };
+
+  const resolveTargetSocketInRoom = (roomId, rawTarget) => {
+    const target = normalizeAlias(rawTarget);
+    if (!roomId || !target) return null;
+
+    // Direct socket id path.
+    const directSocket = conferenceNsp.sockets.get(target);
+    if (directSocket && socketRoomMap.get(target) === roomId) {
+      return { targetSocketId: target, targetUserId: String(directSocket.userId || '') };
+    }
+
+    // userId path via sockets in room.
+    const room = rooms.get(roomId);
+    if (!room) return null;
+    for (const socketId of room.peers.keys()) {
+      const peerSocket = conferenceNsp.sockets.get(socketId);
+      if (!peerSocket) continue;
+      if (normalizeAlias(peerSocket.userId) === target) {
+        return { targetSocketId: socketId, targetUserId: String(peerSocket.userId || target) };
+      }
+    }
+    return null;
+  };
+
+  const canManageRoom = (roomId) => {
+    if (!roomId) return false;
+    if (socket.isAdmin) return true;
+    const roomHostId = String(roomHostByRoom.get(roomId) || '');
+    return Boolean(roomHostId && roomHostId === socket.userId);
+  };
+
   socket.on('join-room', async (data, callback) => {
     // Handle both roomId and roomName (mobile app uses roomName)
     const roomId = data.roomId || data.roomName;
@@ -220,6 +256,10 @@ conferenceNsp.on('connection', (socket) => {
     
     room.peers.set(socket.id, { transports: [], producers: [], consumers: [] });
 
+    if (!roomHostByRoom.has(roomId)) {
+      roomHostByRoom.set(roomId, socket.userId);
+    }
+
     console.log(`[MediaServer] User joined room ${roomId}: ${socket.userName} (Socket: ${socket.id})`);
 
     // Send SFU mode confirmation (Always SFU in this service)
@@ -227,6 +267,7 @@ conferenceNsp.on('connection', (socket) => {
       roomId,
       mode: 'sfu',
       isAdmin: socket.isAdmin,
+      hostId: roomHostByRoom.get(roomId) || null,
       iceServers: ICE_SERVERS, // CRITICAL: Include TURN servers for NAT traversal
       participants: [] // Client will get participants via user-joined events or can request them
     };
@@ -267,10 +308,28 @@ conferenceNsp.on('connection', (socket) => {
         const peer = room.peers.get(socket.id);
         peer.transports.forEach(t => t.close());
         room.peers.delete(socket.id);
+
+        if (roomHostByRoom.get(roomId) === socket.userId) {
+          let nextHostId = null;
+          for (const socketId of room.peers.keys()) {
+            const peerSocket = conferenceNsp.sockets.get(socketId);
+            if (peerSocket?.userId) {
+              nextHostId = String(peerSocket.userId);
+              break;
+            }
+          }
+          if (nextHostId) {
+            roomHostByRoom.set(roomId, nextHostId);
+            conferenceNsp.to(roomId).emit('host-changed', { hostId: nextHostId });
+          } else {
+            roomHostByRoom.delete(roomId);
+          }
+        }
         
         if (room.peers.size === 0) {
           room.router.close();
           rooms.delete(roomId);
+          roomHostByRoom.delete(roomId);
           console.log(`Room ${roomId} closed`);
         }
       }
@@ -650,6 +709,103 @@ conferenceNsp.on('connection', (socket) => {
   
   socket.on('ice-candidate', (data) => {
       socket.to(data.to).emit('ice-candidate', { ...data, from: socket.id });
+  });
+
+  // --- Host controls ---
+  socket.on('mute-participant', ({ targetUserId, userId }, callback) => {
+    const roomId = socketRoomMap.get(socket.id);
+    if (!roomId) return callback?.({ error: 'Room not found' });
+    if (!canManageRoom(roomId)) return callback?.({ error: 'Sadece host bu islemi yapabilir.' });
+    const target = resolveTargetSocketInRoom(roomId, targetUserId || userId);
+    if (!target?.targetSocketId) return callback?.({ error: 'Kullanici odada degil.' });
+
+    conferenceNsp.to(target.targetSocketId).emit('force-mute', {
+      by: socket.userId,
+      byName: socket.userName,
+    });
+    conferenceNsp.to(roomId).emit('participant-muted', {
+      userId: target.targetUserId,
+      by: socket.userId,
+    });
+    callback?.({ success: true });
+  });
+
+  socket.on('unmute-participant', ({ targetUserId, userId }, callback) => {
+    const roomId = socketRoomMap.get(socket.id);
+    if (!roomId) return callback?.({ error: 'Room not found' });
+    if (!canManageRoom(roomId)) return callback?.({ error: 'Sadece host bu islemi yapabilir.' });
+    const target = resolveTargetSocketInRoom(roomId, targetUserId || userId);
+    if (!target?.targetSocketId) return callback?.({ error: 'Kullanici odada degil.' });
+
+    conferenceNsp.to(target.targetSocketId).emit('force-unmute', {
+      by: socket.userId,
+      byName: socket.userName,
+    });
+    conferenceNsp.to(roomId).emit('participant-unmuted', {
+      userId: target.targetUserId,
+      by: socket.userId,
+    });
+    callback?.({ success: true });
+  });
+
+  socket.on('set-participant-video', ({ targetUserId, userId, enabled }, callback) => {
+    const roomId = socketRoomMap.get(socket.id);
+    if (!roomId) return callback?.({ error: 'Room not found' });
+    if (!canManageRoom(roomId)) return callback?.({ error: 'Sadece host bu islemi yapabilir.' });
+    const target = resolveTargetSocketInRoom(roomId, targetUserId || userId);
+    if (!target?.targetSocketId) return callback?.({ error: 'Kullanici odada degil.' });
+
+    conferenceNsp.to(target.targetSocketId).emit('force-video-toggle', {
+      enabled: Boolean(enabled),
+      by: socket.userId,
+      byName: socket.userName,
+    });
+    conferenceNsp.to(roomId).emit('participant-video-forced', {
+      userId: target.targetUserId,
+      enabled: Boolean(enabled),
+      by: socket.userId,
+    });
+    callback?.({ success: true });
+  });
+
+  socket.on('kick-participant', ({ targetUserId, userId }, callback) => {
+    const roomId = socketRoomMap.get(socket.id);
+    if (!roomId) return callback?.({ error: 'Room not found' });
+    if (!canManageRoom(roomId)) return callback?.({ error: 'Sadece host bu islemi yapabilir.' });
+    const target = resolveTargetSocketInRoom(roomId, targetUserId || userId);
+    if (!target?.targetSocketId) return callback?.({ error: 'Kullanici odada degil.' });
+
+    conferenceNsp.to(target.targetSocketId).emit('kicked', {
+      by: socket.userId,
+      byName: socket.userName,
+    });
+    setTimeout(() => {
+      const targetSocket = conferenceNsp.sockets.get(target.targetSocketId);
+      if (targetSocket) {
+        targetSocket.disconnect();
+      }
+    }, 100);
+    callback?.({ success: true });
+  });
+
+  socket.on('ban-participant', ({ targetUserId, userId }, callback) => {
+    const roomId = socketRoomMap.get(socket.id);
+    if (!roomId) return callback?.({ error: 'Room not found' });
+    if (!canManageRoom(roomId)) return callback?.({ error: 'Sadece host bu islemi yapabilir.' });
+    const target = resolveTargetSocketInRoom(roomId, targetUserId || userId);
+    if (!target?.targetSocketId) return callback?.({ error: 'Kullanici odada degil.' });
+
+    conferenceNsp.to(target.targetSocketId).emit('banned', {
+      by: socket.userId,
+      byName: socket.userName,
+    });
+    setTimeout(() => {
+      const targetSocket = conferenceNsp.sockets.get(target.targetSocketId);
+      if (targetSocket) {
+        targetSocket.disconnect();
+      }
+    }, 100);
+    callback?.({ success: true });
   });
   
   // --- Chat / Reactions / Typing (vizyo clients use same namespace) ---
