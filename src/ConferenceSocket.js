@@ -160,6 +160,23 @@ module.exports = async function init(io) {
 
       room.peers.delete(socket.id);
 
+      // If host left, transfer to next peer (if any)
+      if (room.hostSocketId === socket.id && room.peers.size > 0) {
+          const nextPeer = room.peers.values().next().value;
+          if (nextPeer) {
+              room.hostSocketId = nextPeer.socketId;
+              room.hostUserId = nextPeer.userId;
+              console.log(`[ConferenceSocket] Host transferred in room ${roomId}: ${nextPeer.userId}`);
+              try {
+                  // Notify the new host and the room
+                  conferenceNsp.to(roomId).emit('host-changed', {
+                      hostSocketId: nextPeer.socketId,
+                      hostUserId: nextPeer.userId,
+                  });
+              } catch (e) {}
+          }
+      }
+
       if (room.peers.size === 0) {
         try { room.router.close(); } catch (e) {}
         rooms.delete(roomId);
@@ -264,6 +281,20 @@ module.exports = async function init(io) {
       if (room.peers.has(socket.id)) {
           const oldPeer = room.peers.get(socket.id);
           oldPeer.transports.forEach(t => t.close());
+      }
+
+      // Ban check
+      if (room.bannedUserIds && socket.userId && room.bannedUserIds.has(String(socket.userId))) {
+          console.warn(`[ConferenceSocket] Banned user attempted to join room ${roomId}: ${socket.userId}`);
+          if (typeof callback === 'function') callback({ error: 'Bu odadan engellendiniz.' });
+          return;
+      }
+
+      // Track host: first joiner becomes host if not already set
+      if (!room.hostSocketId) {
+          room.hostSocketId = socket.id;
+          room.hostUserId = socket.userId;
+          console.log(`[ConferenceSocket] Host assigned for room ${roomId}: ${socket.userId} (${socket.userName})`);
       }
       
       room.peers.set(socket.id, { 
@@ -927,6 +958,242 @@ module.exports = async function init(io) {
     socket.on('conference:toggleVideo', (data) => {
         console.log(`[ConferenceSocket] conference:toggleVideo ${socket.userName}: isVideoOff=${data?.isVideoOff} enabled=${data?.enabled}`);
         handleVideoToggle(data).catch(() => {});
+    });
+
+    // --- Host Moderation Handlers ---
+    const normalizeAlias = (value) => {
+        const text = String(value || '').trim();
+        return text.startsWith('sfu-') ? text.slice(4) : text;
+    };
+
+    const resolveTargetPeer = (room, rawTarget) => {
+        const target = normalizeAlias(rawTarget);
+        if (!room || !target) return null;
+        // Direct socketId match
+        if (room.peers.has(target)) {
+            return room.peers.get(target);
+        }
+        // Match by userId
+        for (const peer of room.peers.values()) {
+            if (normalizeAlias(peer.userId) === target) return peer;
+            if (normalizeAlias(peer.socketId) === target) return peer;
+        }
+        return null;
+    };
+
+    const canModerate = (room) => {
+        if (!room) return false;
+        const self = room.peers.get(socket.id);
+        if (!self) return false;
+        if (self.isAdmin) return true;
+        // First joiner fallback (oldest peer by insertion order)
+        const firstPeer = room.peers.values().next().value;
+        if (firstPeer && firstPeer.socketId === socket.id) return true;
+        // Explicit host tracking
+        if (room.hostSocketId && room.hostSocketId === socket.id) return true;
+        if (room.hostUserId && String(room.hostUserId) === String(socket.userId)) return true;
+        return false;
+    };
+
+    const pauseTargetProducers = async (targetPeer, kind) => {
+        if (!targetPeer?.producers?.length) return;
+        const ops = [];
+        for (const producer of targetPeer.producers) {
+            if (producer.kind !== kind) continue;
+            ops.push(producer.pause());
+        }
+        if (ops.length) await Promise.allSettled(ops);
+    };
+
+    const resumeTargetProducers = async (targetPeer, kind) => {
+        if (!targetPeer?.producers?.length) return;
+        const ops = [];
+        for (const producer of targetPeer.producers) {
+            if (producer.kind !== kind) continue;
+            ops.push(producer.resume());
+        }
+        if (ops.length) await Promise.allSettled(ops);
+    };
+
+    socket.on('mute-participant', async ({ targetUserId, userId } = {}, callback) => {
+        console.log(`[ConferenceSocket] mute-participant recv by=${socket.userId} target=${targetUserId || userId}`);
+        try {
+            const { roomId, room } = findRoomAndPeer();
+            if (!room || !roomId) return callback?.({ error: 'Room not found' });
+            if (!canModerate(room)) return callback?.({ error: 'Sadece host bu islemi yapabilir.' });
+            const target = resolveTargetPeer(room, targetUserId || userId);
+            if (!target) return callback?.({ error: 'Kullanici odada degil.' });
+
+            await pauseTargetProducers(target, 'audio');
+
+            conferenceNsp.to(target.socketId).emit('force-mute', {
+                by: socket.userId,
+                byName: socket.userName,
+            });
+            conferenceNsp.to(roomId).emit('participant-muted', {
+                userId: target.userId,
+                socketId: target.socketId,
+                by: socket.userId,
+            });
+            conferenceNsp.to(roomId).emit('user-audio-toggle', {
+                userId: target.userId,
+                socketId: target.socketId,
+                enabled: false,
+            });
+            conferenceNsp.to(roomId).emit('conference:audioToggle', {
+                userId: target.userId,
+                isMuted: true,
+            });
+            console.log(`[ConferenceSocket] mute-participant ok room=${roomId} target=${target.userId}`);
+            callback?.({ success: true });
+        } catch (err) {
+            console.error('[ConferenceSocket] mute-participant failed', err);
+            callback?.({ error: err?.message || 'Mute failed' });
+        }
+    });
+
+    socket.on('unmute-participant', async ({ targetUserId, userId } = {}, callback) => {
+        console.log(`[ConferenceSocket] unmute-participant recv by=${socket.userId} target=${targetUserId || userId}`);
+        try {
+            const { roomId, room } = findRoomAndPeer();
+            if (!room || !roomId) return callback?.({ error: 'Room not found' });
+            if (!canModerate(room)) return callback?.({ error: 'Sadece host bu islemi yapabilir.' });
+            const target = resolveTargetPeer(room, targetUserId || userId);
+            if (!target) return callback?.({ error: 'Kullanici odada degil.' });
+
+            await resumeTargetProducers(target, 'audio');
+
+            conferenceNsp.to(target.socketId).emit('force-unmute', {
+                by: socket.userId,
+                byName: socket.userName,
+            });
+            conferenceNsp.to(roomId).emit('participant-unmuted', {
+                userId: target.userId,
+                socketId: target.socketId,
+                by: socket.userId,
+            });
+            conferenceNsp.to(roomId).emit('user-audio-toggle', {
+                userId: target.userId,
+                socketId: target.socketId,
+                enabled: true,
+            });
+            conferenceNsp.to(roomId).emit('conference:audioToggle', {
+                userId: target.userId,
+                isMuted: false,
+            });
+            console.log(`[ConferenceSocket] unmute-participant ok room=${roomId} target=${target.userId}`);
+            callback?.({ success: true });
+        } catch (err) {
+            console.error('[ConferenceSocket] unmute-participant failed', err);
+            callback?.({ error: err?.message || 'Unmute failed' });
+        }
+    });
+
+    socket.on('set-participant-video', async ({ targetUserId, userId, enabled } = {}, callback) => {
+        console.log(`[ConferenceSocket] set-participant-video recv by=${socket.userId} target=${targetUserId || userId} enabled=${enabled}`);
+        try {
+            const { roomId, room } = findRoomAndPeer();
+            if (!room || !roomId) return callback?.({ error: 'Room not found' });
+            if (!canModerate(room)) return callback?.({ error: 'Sadece host bu islemi yapabilir.' });
+            const target = resolveTargetPeer(room, targetUserId || userId);
+            if (!target) return callback?.({ error: 'Kullanici odada degil.' });
+
+            const wantEnabled = Boolean(enabled);
+            if (wantEnabled) {
+                await resumeTargetProducers(target, 'video');
+            } else {
+                await pauseTargetProducers(target, 'video');
+            }
+
+            conferenceNsp.to(target.socketId).emit('force-video-toggle', {
+                enabled: wantEnabled,
+                by: socket.userId,
+                byName: socket.userName,
+            });
+            conferenceNsp.to(roomId).emit('participant-video-forced', {
+                userId: target.userId,
+                socketId: target.socketId,
+                enabled: wantEnabled,
+                by: socket.userId,
+            });
+            conferenceNsp.to(roomId).emit('user-video-toggle', {
+                userId: target.userId,
+                socketId: target.socketId,
+                enabled: wantEnabled,
+            });
+            conferenceNsp.to(roomId).emit('conference:videoToggle', {
+                userId: target.userId,
+                isVideoOff: !wantEnabled,
+            });
+            console.log(`[ConferenceSocket] set-participant-video ok room=${roomId} target=${target.userId} enabled=${wantEnabled}`);
+            callback?.({ success: true });
+        } catch (err) {
+            console.error('[ConferenceSocket] set-participant-video failed', err);
+            callback?.({ error: err?.message || 'Set video failed' });
+        }
+    });
+
+    socket.on('kick-participant', ({ targetUserId, userId } = {}, callback) => {
+        console.log(`[ConferenceSocket] kick-participant recv by=${socket.userId} target=${targetUserId || userId}`);
+        try {
+            const { roomId, room } = findRoomAndPeer();
+            if (!room || !roomId) return callback?.({ error: 'Room not found' });
+            if (!canModerate(room)) return callback?.({ error: 'Sadece host bu islemi yapabilir.' });
+            const target = resolveTargetPeer(room, targetUserId || userId);
+            if (!target) return callback?.({ error: 'Kullanici odada degil.' });
+
+            conferenceNsp.to(target.socketId).emit('kicked', {
+                by: socket.userId,
+                byName: socket.userName,
+            });
+            conferenceNsp.to(roomId).emit('participant-kicked', {
+                userId: target.userId,
+                socketId: target.socketId,
+                by: socket.userId,
+            });
+            setTimeout(() => {
+                const targetSocket = conferenceNsp.sockets.get(target.socketId);
+                if (targetSocket) targetSocket.disconnect();
+            }, 150);
+            console.log(`[ConferenceSocket] kick-participant ok room=${roomId} target=${target.userId}`);
+            callback?.({ success: true });
+        } catch (err) {
+            console.error('[ConferenceSocket] kick-participant failed', err);
+            callback?.({ error: err?.message || 'Kick failed' });
+        }
+    });
+
+    socket.on('ban-participant', ({ targetUserId, userId } = {}, callback) => {
+        console.log(`[ConferenceSocket] ban-participant recv by=${socket.userId} target=${targetUserId || userId}`);
+        try {
+            const { roomId, room } = findRoomAndPeer();
+            if (!room || !roomId) return callback?.({ error: 'Room not found' });
+            if (!canModerate(room)) return callback?.({ error: 'Sadece host bu islemi yapabilir.' });
+            const target = resolveTargetPeer(room, targetUserId || userId);
+            if (!target) return callback?.({ error: 'Kullanici odada degil.' });
+
+            if (!room.bannedUserIds) room.bannedUserIds = new Set();
+            if (target.userId) room.bannedUserIds.add(String(target.userId));
+
+            conferenceNsp.to(target.socketId).emit('banned', {
+                by: socket.userId,
+                byName: socket.userName,
+            });
+            conferenceNsp.to(roomId).emit('participant-banned', {
+                userId: target.userId,
+                socketId: target.socketId,
+                by: socket.userId,
+            });
+            setTimeout(() => {
+                const targetSocket = conferenceNsp.sockets.get(target.socketId);
+                if (targetSocket) targetSocket.disconnect();
+            }, 150);
+            console.log(`[ConferenceSocket] ban-participant ok room=${roomId} target=${target.userId}`);
+            callback?.({ success: true });
+        } catch (err) {
+            console.error('[ConferenceSocket] ban-participant failed', err);
+            callback?.({ error: err?.message || 'Ban failed' });
+        }
     });
 
     // --- Poll Handlers ---
