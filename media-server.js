@@ -711,6 +711,25 @@ conferenceNsp.on('connection', (socket) => {
       socket.to(data.to).emit('ice-candidate', { ...data, from: socket.id });
   });
 
+  // --- Self media toggle (participant announces own mute/unmute) ---
+  socket.on('toggle-audio', ({ enabled } = {}) => {
+    const roomId = socketRoomMap.get(socket.id);
+    if (!roomId) return;
+    socket.to(roomId).emit('user-audio-toggle', {
+      userId: socket.userId,
+      enabled: Boolean(enabled),
+    });
+  });
+
+  socket.on('toggle-video', ({ enabled } = {}) => {
+    const roomId = socketRoomMap.get(socket.id);
+    if (!roomId) return;
+    socket.to(roomId).emit('user-video-toggle', {
+      userId: socket.userId,
+      enabled: Boolean(enabled),
+    });
+  });
+
   // --- Host controls ---
   socket.on('mute-participant', ({ targetUserId, userId }, callback) => {
     const roomId = socketRoomMap.get(socket.id);
@@ -726,6 +745,10 @@ conferenceNsp.on('connection', (socket) => {
     conferenceNsp.to(roomId).emit('participant-muted', {
       userId: target.targetUserId,
       by: socket.userId,
+    });
+    conferenceNsp.to(roomId).emit('user-audio-toggle', {
+      userId: target.targetUserId,
+      enabled: false,
     });
     callback?.({ success: true });
   });
@@ -744,6 +767,10 @@ conferenceNsp.on('connection', (socket) => {
     conferenceNsp.to(roomId).emit('participant-unmuted', {
       userId: target.targetUserId,
       by: socket.userId,
+    });
+    conferenceNsp.to(roomId).emit('user-audio-toggle', {
+      userId: target.targetUserId,
+      enabled: true,
     });
     callback?.({ success: true });
   });
@@ -764,6 +791,10 @@ conferenceNsp.on('connection', (socket) => {
       userId: target.targetUserId,
       enabled: Boolean(enabled),
       by: socket.userId,
+    });
+    conferenceNsp.to(roomId).emit('user-video-toggle', {
+      userId: target.targetUserId,
+      enabled: Boolean(enabled),
     });
     callback?.({ success: true });
   });
