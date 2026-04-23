@@ -732,71 +732,92 @@ conferenceNsp.on('connection', (socket) => {
 
   // --- Host controls ---
   socket.on('mute-participant', ({ targetUserId, userId }, callback) => {
-    const roomId = socketRoomMap.get(socket.id);
-    if (!roomId) return callback?.({ error: 'Room not found' });
-    if (!canManageRoom(roomId)) return callback?.({ error: 'Sadece host bu islemi yapabilir.' });
-    const target = resolveTargetSocketInRoom(roomId, targetUserId || userId);
-    if (!target?.targetSocketId) return callback?.({ error: 'Kullanici odada degil.' });
+    console.log('[TF-SFU] mute-participant recv', { by: socket.userId, socketId: socket.id, targetUserId, userId });
+    try {
+      const roomId = socketRoomMap.get(socket.id);
+      if (!roomId) return callback?.({ error: 'Room not found' });
+      if (!canManageRoom(roomId)) return callback?.({ error: 'Sadece host bu islemi yapabilir.' });
+      const target = resolveTargetSocketInRoom(roomId, targetUserId || userId);
+      if (!target?.targetSocketId) return callback?.({ error: 'Kullanici odada degil.' });
 
-    conferenceNsp.to(target.targetSocketId).emit('force-mute', {
-      by: socket.userId,
-      byName: socket.userName,
-    });
-    conferenceNsp.to(roomId).emit('participant-muted', {
-      userId: target.targetUserId,
-      by: socket.userId,
-    });
-    conferenceNsp.to(roomId).emit('user-audio-toggle', {
-      userId: target.targetUserId,
-      enabled: false,
-    });
-    callback?.({ success: true });
+      conferenceNsp.to(target.targetSocketId).emit('force-mute', {
+        by: socket.userId,
+        byName: socket.userName,
+      });
+      conferenceNsp.to(roomId).emit('participant-muted', {
+        userId: target.targetUserId,
+        by: socket.userId,
+      });
+      conferenceNsp.to(roomId).emit('user-audio-toggle', {
+        userId: target.targetUserId,
+        enabled: false,
+      });
+      console.log('[TF-SFU] mute-participant ok', { roomId, target: target.targetUserId });
+      callback?.({ success: true });
+    } catch (err) {
+      console.error('[TF-SFU] mute-participant failed', err);
+      callback?.({ error: err?.message || 'Mute failed' });
+    }
   });
 
   socket.on('unmute-participant', ({ targetUserId, userId }, callback) => {
-    const roomId = socketRoomMap.get(socket.id);
-    if (!roomId) return callback?.({ error: 'Room not found' });
-    if (!canManageRoom(roomId)) return callback?.({ error: 'Sadece host bu islemi yapabilir.' });
-    const target = resolveTargetSocketInRoom(roomId, targetUserId || userId);
-    if (!target?.targetSocketId) return callback?.({ error: 'Kullanici odada degil.' });
+    console.log('[TF-SFU] unmute-participant recv', { by: socket.userId, socketId: socket.id, targetUserId, userId });
+    try {
+      const roomId = socketRoomMap.get(socket.id);
+      if (!roomId) return callback?.({ error: 'Room not found' });
+      if (!canManageRoom(roomId)) return callback?.({ error: 'Sadece host bu islemi yapabilir.' });
+      const target = resolveTargetSocketInRoom(roomId, targetUserId || userId);
+      if (!target?.targetSocketId) return callback?.({ error: 'Kullanici odada degil.' });
 
-    conferenceNsp.to(target.targetSocketId).emit('force-unmute', {
-      by: socket.userId,
-      byName: socket.userName,
-    });
-    conferenceNsp.to(roomId).emit('participant-unmuted', {
-      userId: target.targetUserId,
-      by: socket.userId,
-    });
-    conferenceNsp.to(roomId).emit('user-audio-toggle', {
-      userId: target.targetUserId,
-      enabled: true,
-    });
-    callback?.({ success: true });
+      conferenceNsp.to(target.targetSocketId).emit('force-unmute', {
+        by: socket.userId,
+        byName: socket.userName,
+      });
+      conferenceNsp.to(roomId).emit('participant-unmuted', {
+        userId: target.targetUserId,
+        by: socket.userId,
+      });
+      conferenceNsp.to(roomId).emit('user-audio-toggle', {
+        userId: target.targetUserId,
+        enabled: true,
+      });
+      console.log('[TF-SFU] unmute-participant ok', { roomId, target: target.targetUserId });
+      callback?.({ success: true });
+    } catch (err) {
+      console.error('[TF-SFU] unmute-participant failed', err);
+      callback?.({ error: err?.message || 'Unmute failed' });
+    }
   });
 
   socket.on('set-participant-video', ({ targetUserId, userId, enabled }, callback) => {
-    const roomId = socketRoomMap.get(socket.id);
-    if (!roomId) return callback?.({ error: 'Room not found' });
-    if (!canManageRoom(roomId)) return callback?.({ error: 'Sadece host bu islemi yapabilir.' });
-    const target = resolveTargetSocketInRoom(roomId, targetUserId || userId);
-    if (!target?.targetSocketId) return callback?.({ error: 'Kullanici odada degil.' });
+    console.log('[TF-SFU] set-participant-video recv', { by: socket.userId, socketId: socket.id, targetUserId, userId, enabled });
+    try {
+      const roomId = socketRoomMap.get(socket.id);
+      if (!roomId) return callback?.({ error: 'Room not found' });
+      if (!canManageRoom(roomId)) return callback?.({ error: 'Sadece host bu islemi yapabilir.' });
+      const target = resolveTargetSocketInRoom(roomId, targetUserId || userId);
+      if (!target?.targetSocketId) return callback?.({ error: 'Kullanici odada degil.' });
 
-    conferenceNsp.to(target.targetSocketId).emit('force-video-toggle', {
-      enabled: Boolean(enabled),
-      by: socket.userId,
-      byName: socket.userName,
-    });
-    conferenceNsp.to(roomId).emit('participant-video-forced', {
-      userId: target.targetUserId,
-      enabled: Boolean(enabled),
-      by: socket.userId,
-    });
-    conferenceNsp.to(roomId).emit('user-video-toggle', {
-      userId: target.targetUserId,
-      enabled: Boolean(enabled),
-    });
-    callback?.({ success: true });
+      conferenceNsp.to(target.targetSocketId).emit('force-video-toggle', {
+        enabled: Boolean(enabled),
+        by: socket.userId,
+        byName: socket.userName,
+      });
+      conferenceNsp.to(roomId).emit('participant-video-forced', {
+        userId: target.targetUserId,
+        enabled: Boolean(enabled),
+        by: socket.userId,
+      });
+      conferenceNsp.to(roomId).emit('user-video-toggle', {
+        userId: target.targetUserId,
+        enabled: Boolean(enabled),
+      });
+      console.log('[TF-SFU] set-participant-video ok', { roomId, target: target.targetUserId, enabled: Boolean(enabled) });
+      callback?.({ success: true });
+    } catch (err) {
+      console.error('[TF-SFU] set-participant-video failed', err);
+      callback?.({ error: err?.message || 'Set video failed' });
+    }
   });
 
   socket.on('kick-participant', ({ targetUserId, userId }, callback) => {
