@@ -1,6 +1,7 @@
 const mediasoup = require('mediasoup');
 const jwt = require('jsonwebtoken');
 const dotenv = require('dotenv');
+const axios = require('axios');
 const config = require('./config');
 
 dotenv.config();
@@ -8,8 +9,8 @@ dotenv.config();
 // Configuration
 const JWT_SECRET = process.env.JWT_SECRET || (config.jwt && config.jwt.key) || 'saigm_video_chat_sfu_jwt_secret';
 const JWT_SECRETS_ENV = process.env.JWT_SECRETS || process.env.JWT_SECRETS_LIST || '';
-const MEDIASOUP_MIN_PORT = parseInt(process.env.MEDIASOUP_MIN_PORT) || 40000; // Safe range
-const MEDIASOUP_MAX_PORT = parseInt(process.env.MEDIASOUP_MAX_PORT) || 40100;
+const MEDIASOUP_MIN_PORT = parseInt(process.env.MEDIASOUP_MIN_PORT, 10) || 40000; // Safe range
+const MEDIASOUP_MAX_PORT = parseInt(process.env.MEDIASOUP_MAX_PORT, 10) || 40100;
 const MEDIASOUP_LISTEN_IP = process.env.MEDIASOUP_LISTEN_IP || '0.0.0.0';
 const MEDIASOUP_ANNOUNCED_IP = process.env.MEDIASOUP_ANNOUNCED_IP || '104.248.212.6'; // Public IP fallback
 
@@ -96,6 +97,67 @@ console.log('[ConferenceSocket] Mediasoup config:', {
 let workers = [];
 let nextWorkerIndex = 0;
 const rooms = new Map(); // roomId -> { router, peers: Map<socketId, { transports, producers, consumers }> }
+
+// Main REST backend (used to load persistent bans and persist kick/ban actions).
+const BACKEND_BASE_URL =
+  process.env.CONFERENCE_BACKEND_URL ||
+  process.env.BACKEND_BASE_URL ||
+  'https://api.appandcapital.com.tr/v1';
+
+/**
+ * Load the persistent bannedUsers list for a conference from the main backend.
+ * Uses the joining user's JWT so no extra service-account is needed.
+ * Returns an array of string userIds (may be empty on failure).
+ */
+async function fetchBannedUsersFromBackend(roomId, userToken) {
+  if (!roomId || !userToken) return [];
+  try {
+    const res = await axios.get(
+      `${BACKEND_BASE_URL}/conferences/room/${encodeURIComponent(roomId)}`,
+      {
+        headers: { Authorization: `Bearer ${userToken}` },
+        timeout: 5000,
+      }
+    );
+    const banned = (res && res.data && res.data.bannedUsers) || [];
+    return banned
+      .map((u) => {
+        if (!u) return '';
+        if (typeof u === 'string') return u;
+        return String(u.id || u._id || '');
+      })
+      .filter(Boolean);
+  } catch (err) {
+    console.warn(
+      `[ConferenceSocket] Failed to load bannedUsers for room ${roomId}:`,
+      err?.response?.status || err?.message || err
+    );
+    return [];
+  }
+}
+
+/**
+ * Persist a kick/ban to the main backend so the ban survives SFU restarts and
+ * is enforced by the REST /conferences/:roomId/join endpoint as well.
+ */
+async function persistKickOnBackend(roomId, targetUserId, hostToken) {
+  if (!roomId || !targetUserId || !hostToken) return;
+  try {
+    await axios.post(
+      `${BACKEND_BASE_URL}/conferences/${encodeURIComponent(roomId)}/kick`,
+      { userId: String(targetUserId) },
+      {
+        headers: { Authorization: `Bearer ${hostToken}` },
+        timeout: 5000,
+      }
+    );
+  } catch (err) {
+    console.warn(
+      `[ConferenceSocket] Failed to persist kick for room ${roomId} target ${targetUserId}:`,
+      err?.response?.status || err?.message || err
+    );
+  }
+}
 
 // Initialize Mediasoup Workers
 async function runMediasoupWorkers() {
@@ -238,6 +300,9 @@ module.exports = async function init(io) {
     socket.isAdmin = !!(decoded.is_admin || decoded.role === 'admin' || decoded.admin);
     socket.userName = socket.handshake.query.name || 'User';
     socket.userAvatar = socket.handshake.query.avatar || null;
+    // Keep the raw token around so kick/ban handlers can forward it to the
+    // main backend to persist the ban in MongoDB.
+    socket.authToken = token;
     next();
   });
 
@@ -247,6 +312,9 @@ module.exports = async function init(io) {
     socket.on('join-room', async (data, callback) => {
       const roomId = data.roomId || data.roomName;
       const { userName } = data;
+      const claimedHostUserId = String(
+          data.hostUserId || data.hostId || socket.handshake.query?.hostUserId || ''
+      ).trim();
       
       if (!roomId) {
           if (typeof callback === 'function') callback({ error: 'Missing roomId' });
@@ -272,9 +340,26 @@ module.exports = async function init(io) {
         rooms.set(roomId, { 
           router, 
           peers: new Map(),
-          polls: []
+          polls: [],
+          bannedUserIds: new Set(),
         });
         console.log(`[ConferenceSocket] Created router for room ${roomId}`);
+
+        // Seed the persistent bannedUsers list from the main backend so that
+        // a user kicked in a previous SFU lifetime cannot rejoin after a
+        // restart or after the room was torn down and recreated.
+        try {
+          const banned = await fetchBannedUsersFromBackend(roomId, socket.authToken);
+          const roomRef = rooms.get(roomId);
+          if (roomRef && banned.length) {
+            banned.forEach((id) => roomRef.bannedUserIds.add(String(id)));
+            console.log(
+              `[ConferenceSocket] Seeded ${banned.length} banned user(s) for room ${roomId} from backend`
+            );
+          }
+        } catch (e) {
+          console.warn('[ConferenceSocket] Ban seed failed:', e?.message || e);
+        }
       }
 
       const room = rooms.get(roomId);
@@ -283,10 +368,12 @@ module.exports = async function init(io) {
           oldPeer.transports.forEach(t => t.close());
       }
 
-      // Ban check
+      // Ban check (in-memory set, seeded from DB on room creation).
       if (room.bannedUserIds && socket.userId && room.bannedUserIds.has(String(socket.userId))) {
           console.warn(`[ConferenceSocket] Banned user attempted to join room ${roomId}: ${socket.userId}`);
           if (typeof callback === 'function') callback({ error: 'Bu odadan engellendiniz.' });
+          socket.emit('banned', { by: null, byName: null, reason: 'persistent-ban' });
+          try { socket.disconnect(); } catch {}
           return;
       }
 
@@ -295,6 +382,31 @@ module.exports = async function init(io) {
           room.hostSocketId = socket.id;
           room.hostUserId = socket.userId;
           console.log(`[ConferenceSocket] Host assigned for room ${roomId}: ${socket.userId} (${socket.userName})`);
+      }
+
+      // If this user's id matches the conference's real host (claimed via handshake/join),
+      // promote them even if someone else joined first. Client has this info from DB.
+      if (claimedHostUserId && String(socket.userId) === claimedHostUserId) {
+          if (room.hostSocketId !== socket.id || String(room.hostUserId) !== claimedHostUserId) {
+              console.log(`[ConferenceSocket] Host promotion in room ${roomId}: ${socket.userId} (was ${room.hostUserId})`);
+              room.hostSocketId = socket.id;
+              room.hostUserId = claimedHostUserId;
+              try {
+                  conferenceNsp.to(roomId).emit('host-changed', {
+                      hostSocketId: socket.id,
+                      hostUserId: claimedHostUserId,
+                  });
+              } catch (e) {}
+          }
+      }
+      // Remember the claimed host id (by all clients) so later join orders still promote correctly.
+      if (claimedHostUserId && !room.expectedHostUserId) {
+          room.expectedHostUserId = claimedHostUserId;
+      }
+      // If the expected host already joined previously, keep their assignment.
+      if (room.expectedHostUserId && String(socket.userId) === room.expectedHostUserId) {
+          room.hostSocketId = socket.id;
+          room.hostUserId = room.expectedHostUserId;
       }
       
       room.peers.set(socket.id, { 
@@ -986,12 +1098,13 @@ module.exports = async function init(io) {
         const self = room.peers.get(socket.id);
         if (!self) return false;
         if (self.isAdmin) return true;
-        // First joiner fallback (oldest peer by insertion order)
-        const firstPeer = room.peers.values().next().value;
-        if (firstPeer && firstPeer.socketId === socket.id) return true;
-        // Explicit host tracking
+        // Explicit host tracking (set on join-room via claimed hostUserId from DB)
         if (room.hostSocketId && room.hostSocketId === socket.id) return true;
         if (room.hostUserId && String(room.hostUserId) === String(socket.userId)) return true;
+        if (room.expectedHostUserId && String(room.expectedHostUserId) === String(socket.userId)) return true;
+        // First joiner fallback (oldest peer by insertion order)
+        const firstPeer = room.peers.values().next().value;
+        if (firstPeer && firstPeer.socketId === socket.id && !room.expectedHostUserId) return true;
         return false;
     };
 
@@ -1142,6 +1255,11 @@ module.exports = async function init(io) {
             const target = resolveTargetPeer(room, targetUserId || userId);
             if (!target) return callback?.({ error: 'Kullanici odada degil.' });
 
+            // Treat kick as a permanent per-room ban so the user cannot rejoin
+            // this conference. This mirrors ban-participant semantics.
+            if (!room.bannedUserIds) room.bannedUserIds = new Set();
+            if (target.userId) room.bannedUserIds.add(String(target.userId));
+
             conferenceNsp.to(target.socketId).emit('kicked', {
                 by: socket.userId,
                 byName: socket.userName,
@@ -1155,6 +1273,13 @@ module.exports = async function init(io) {
                 const targetSocket = conferenceNsp.sockets.get(target.socketId);
                 if (targetSocket) targetSocket.disconnect();
             }, 150);
+
+            // Persist the ban to the main backend so it survives SFU restarts
+            // and is also enforced by the REST /conferences/:roomId/join endpoint.
+            if (target.userId) {
+                persistKickOnBackend(roomId, target.userId, socket.authToken);
+            }
+
             console.log(`[ConferenceSocket] kick-participant ok room=${roomId} target=${target.userId}`);
             callback?.({ success: true });
         } catch (err) {
@@ -1188,6 +1313,13 @@ module.exports = async function init(io) {
                 const targetSocket = conferenceNsp.sockets.get(target.socketId);
                 if (targetSocket) targetSocket.disconnect();
             }, 150);
+
+            // Persist the ban to the main backend so it survives SFU restarts
+            // and is also enforced by the REST /conferences/:roomId/join endpoint.
+            if (target.userId) {
+                persistKickOnBackend(roomId, target.userId, socket.authToken);
+            }
+
             console.log(`[ConferenceSocket] ban-participant ok room=${roomId} target=${target.userId}`);
             callback?.({ success: true });
         } catch (err) {
