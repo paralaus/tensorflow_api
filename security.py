@@ -219,6 +219,69 @@ def harden_history(history: List[dict]) -> List[dict]:
     return out
 
 
+# === Finansal disclaimer enforcement ============================
+# Model promptu unutsa bile kod seviyesinde (deterministik) eklenir.
+DISCLAIMER_TEXT = (
+    "\n\n⚠️ Bu içerik yatırım tavsiyesi değildir; yalnızca genel bilgilendirme amaçlıdır. "
+    "Yatırım kararlarınızı SPK lisanslı kurumlardan profesyonel danışmanlık alarak veriniz. "
+    "Geçmiş performans gelecekteki getirinin garantisi değildir."
+)
+
+# Disclaimer'in zaten cevapta oldugunu sezmek icin (model bazen ekliyor).
+_DISCLAIMER_PRESENT_RE = re.compile(
+    r"(yat[ıi]r[ıi]m\s+tavsiyesi\s+de[ğg]ildir"
+    r"|finansal\s+tavsiye\s+de[ğg]ildir"
+    r"|tavsiye\s+niteli[ğg]inde\s+de[ğg]ildir"
+    r"|bilgilendirme\s+ama[çc]l[ıi]d[ıi]r)",
+    re.IGNORECASE,
+)
+
+# Finansal/yatirim baglami sezici (TR + EN). Bu kelimelerden biri varsa disclaimer eklenir.
+_FINANCIAL_CTX_RE = re.compile(
+    r"\b("
+    r"hisse|bist|borsa|endeks|viop|fon|tahvil|bono|kripto|bitcoin|ethereum|"
+    r"alt[ıi]n|gümü[şs]|emtia|petrol|brent|forex|paritе|parite|"
+    r"dolar|euro|sterlin|tl|kur|"
+    r"yat[ıi]r[ıi]m|portföy|portfoy|getiri|temettü|temettu|kar\s*pay[ıi]|"
+    r"al[ıi]m|sat[ıi]m|al-sat|alsat|long|short|stop\s*loss|kar\s*al|"
+    r"hedef\s*fiyat|tavsiye|öner|oner|sinyal|trend|"
+    r"thyao|garan|akbnk|sise|asels|tuprs|ekgyo|kchol|sahol|"
+    r"rsi|macd|bollinger|fibonacci|destek|direnç|direnc|"
+    r"dü[şs]ecek|yükselecek|yukselecek|patlayacak|uçacak|ucacak|dipte|tepede"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def needs_disclaimer(question: str, answer: str) -> bool:
+    """Soru ya da cevap finansal baglamdaysa True doner."""
+    try:
+        haystack = f"{question or ''}\n{answer or ''}"
+        return bool(_FINANCIAL_CTX_RE.search(haystack))
+    except Exception:
+        # Suphede kal, ekle (yanlis-pozitif tarafa kay).
+        return True
+
+
+def has_disclaimer(text: str) -> bool:
+    if not text:
+        return False
+    return bool(_DISCLAIMER_PRESENT_RE.search(text))
+
+
+def ensure_disclaimer(answer: str, question: str = "") -> Tuple[str, bool]:
+    """LLM cevabina (gerekiyorsa) disclaimer'i deterministik ekler.
+    Donus: (final_text, eklendi_mi). Idempotent: zaten varsa eklemez."""
+    if not isinstance(answer, str) or not answer.strip():
+        return answer, False
+    if has_disclaimer(answer):
+        return answer, False
+    if not needs_disclaimer(question, answer):
+        return answer, False
+    # Cevabin sonundaki bos satirlari sadelestir, sonra disclaimer ekle.
+    return answer.rstrip() + DISCLAIMER_TEXT, True
+
+
 def sanitize_question(raw: Any) -> Tuple[Optional[str], Optional[Tuple[int, str]]]:
     """Sorgu temizleme + validation.
     Donus: (clean_text, None) veya (None, (status_code, error_message))."""
