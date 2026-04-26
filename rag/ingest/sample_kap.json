@@ -1,0 +1,44 @@
+{
+  "disclosures": [
+    {
+      "disclosureIndex": 1320001,
+      "kapTitle": "Garanti BBVA - Konsolide Mali Tablolar 1Ç 2026",
+      "summary": "Garanti BBVA 2026 yili 1. ceyrek konsolide net donem kari 18,5 milyar TL olarak gerceklesmistir. Toplam aktifler 1,9 trilyon TL'ye ulasmistir. Sermaye yeterlilik orani %16,8 seviyesindedir.",
+      "publishDate": "2026-04-26 09:30:15",
+      "stockCodes": ["GARAN"],
+      "basic": {"companyName": "TURKIYE GARANTI BANKASI A.S."}
+    },
+    {
+      "disclosureIndex": 1320002,
+      "kapTitle": "Tupras - Temettu Dagitim Karari",
+      "summary": "Tupras Yonetim Kurulu, 2025 yili kari uzerinden brut hisse basina 12,50 TL nakit temettu dagitilmasini karar altina almistir. Odeme tarihi 15 Mayis 2026 olarak belirlenmistir.",
+      "publishDate": "2026-04-26 10:15:00",
+      "stockCodes": ["TUPRS"],
+      "basic": {"companyName": "TURKIYE PETROL RAFINERILERI A.S."}
+    },
+    {
+      "disclosureIndex": 1320003,
+      "kapTitle": "Aselsan - Yeni Sozlesme",
+      "summary": "Aselsan, Savunma Sanayi Baskanligi ile 240 milyon USD tutarinda radar sistemi tedarik sozlesmesi imzalamistir. Teslimat 2027-2028 yillarinda gerceklesecektir.",
+      "publishDate": "2026-04-26 14:45:30",
+      "stockCodes": ["ASELS"],
+      "basic": {"companyName": "ASELSAN ELEKTRONIK SANAYI VE TIC. A.S."}
+    },
+    {
+      "disclosureIndex": 1320004,
+      "kapTitle": "THY - Trafik Sonuclari Mart 2026",
+      "summary": "Turk Hava Yollari Mart 2026 trafik sonuclarinda yolcu sayisi gecen yilin ayni donemine gore %8,2 artisla 7,1 milyon kisi olarak gerceklesmistir. Doluluk orani %82,5'tir.",
+      "publishDate": "2026-04-25 18:00:00",
+      "stockCodes": ["THYAO"],
+      "basic": {"companyName": "TURK HAVA YOLLARI A.O."}
+    },
+    {
+      "disclosureIndex": 1320005,
+      "title": "Bossa - Genel Kurul Cagrisi",
+      "summary": "Bossa Ticaret ve Sanayi Isletmeleri T.A.S. olagan genel kurul toplantisi 28 Mayis 2026 tarihinde yapilacaktir. Gundemde temettu dagitimi ve yonetim kurulu uye secimi bulunmaktadir.",
+      "publishDate": "2026-04-25 16:20:00",
+      "stockCodes": "BOSSA",
+      "companyName": "BOSSA T.A.S."
+    }
+  ]
+}

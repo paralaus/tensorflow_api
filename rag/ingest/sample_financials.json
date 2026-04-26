@@ -1,0 +1,71 @@
+{
+  "records": [
+    {
+      "ticker": "GARAN",
+      "period": "2025-Q4",
+      "period_end": "2025-12-31",
+      "currency": "TRY",
+      "company": "Turkiye Garanti Bankasi A.S.",
+      "metrics": {
+        "hasilat": 280000000000,
+        "net_kar": 52000000000,
+        "toplam_aktif": 1900000000000,
+        "ozsermaye": 285000000000
+      },
+      "notes": "Sermaye yeterlilik %16,8. Takipteki krediler orani %1,9."
+    },
+    {
+      "ticker": "GARAN",
+      "period": "2026-Q1",
+      "period_end": "2026-03-31",
+      "currency": "TRY",
+      "company": "Turkiye Garanti Bankasi A.S.",
+      "metrics": {
+        "hasilat": 75000000000,
+        "net_kar": 18500000000,
+        "toplam_aktif": 1950000000000,
+        "ozsermaye": 295000000000
+      }
+    },
+    {
+      "ticker": "THYAO",
+      "period": "2025-Q4",
+      "period_end": "2025-12-31",
+      "currency": "TRY",
+      "company": "Turk Hava Yollari A.O.",
+      "metrics": {
+        "hasilat": 920000000000,
+        "brut_kar": 165000000000,
+        "faaliyet_kari": 95000000000,
+        "net_kar": 78000000000,
+        "favok": 145000000000
+      },
+      "notes": "Doluluk orani %82, yolcu sayisi 86 milyon."
+    },
+    {
+      "ticker": "ASELS",
+      "period": "2025-Q4",
+      "period_end": "2025-12-31",
+      "currency": "TRY",
+      "company": "Aselsan Elektronik Sanayi ve Tic. A.S.",
+      "metrics": {
+        "hasilat": 95000000000,
+        "brut_kar": 32000000000,
+        "net_kar": 18000000000,
+        "favok": 28000000000
+      }
+    },
+    {
+      "ticker": "TUPRS",
+      "period": "2025-FY",
+      "period_end": "2025-12-31",
+      "currency": "TRY",
+      "company": "Turkiye Petrol Rafinerileri A.S.",
+      "metrics": {
+        "hasilat": 1200000000000,
+        "net_kar": 42000000000
+      },
+      "notes": "Brut hisse basina 12.50 TL temettu onerildi."
+    }
+  ]
+}

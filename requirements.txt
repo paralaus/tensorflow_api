@@ -19,6 +19,15 @@ flask-limiter>=3.5.0
 prometheus-flask-exporter>=0.23.0
 sentry-sdk[flask]>=1.40.0
 
+# RAG (opsiyonel; bagimliliklar yoksa rag/ paketi sessizce devre disi kalir).
+# CPU sentence-transformers ~120MB indirir (ilk run'da). Server'da kurmak istemiyorsan
+# yorum satirina alabilirsin - app.py rag yoksa kendiliginden atlar.
+sentence-transformers>=2.7.0
+chromadb>=0.5.0
+# Linux/Docker icin: chromadb sistem sqlite3 >=3.35 ister; eski distrolarda pysqlite3
+# swap ile cozuluyor. Windows'ta sistem sqlite3 yeterli, wheel yok - skip ediyoruz.
+pysqlite3-binary>=0.5.0; sys_platform == "linux"
+
 # Opsiyonel - Eski TensorFlow modelleri için
 # transformers>=4.36.0
 # torch>=2.1.0
