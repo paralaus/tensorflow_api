@@ -21,7 +21,32 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
+
+# --- HTTP session (keep-alive). requests yoksa urllib fallback ---
+try:
+    import requests  # type: ignore
+    from requests.adapters import HTTPAdapter  # type: ignore
+
+    _session = requests.Session()
+    _session.headers.update({
+        "User-Agent": "Mozilla/5.0 (HisseChat AI/1.0)",
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+    })
+    _adapter = HTTPAdapter(pool_connections=20, pool_maxsize=50, max_retries=0)
+    _session.mount("https://", _adapter)
+    _session.mount("http://", _adapter)
+    _HAS_REQUESTS = True
+except Exception as _e:
+    _session = None
+    _HAS_REQUESTS = False
+    print(f"[market_data] requests yok, urllib fallback: {_e}")
+
+# Paralel fetch icin shared executor (4 worker yeterli: bist+crypto+fx+index)
+_md_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="md")
 
 # ---------- Basit, thread-safe TTL cache ----------
 _cache: dict[str, tuple[Any, float]] = {}
@@ -49,7 +74,18 @@ def _cache_set(key: str, value: Any):
 
 
 def _http_get_json(url: str, timeout: float = 4.0) -> Any:
-    """Kısa timeout'lu GET; başarısızsa None döner."""
+    """Kısa timeout'lu GET; başarısızsa None döner. requests.Session keep-alive + gzip."""
+    # Once requests.Session (keep-alive, gzip)
+    if _HAS_REQUESTS and _session is not None:
+        try:
+            r = _session.get(url, timeout=timeout)
+            if r.status_code != 200:
+                return None
+            return r.json()
+        except Exception as e:
+            print(f"[market_data] requests hata ({url}): {e}")
+            return None
+    # Fallback: urllib
     try:
         req = urllib.request.Request(
             url,
@@ -254,9 +290,17 @@ def fetch_yahoo_quote(symbol: str) -> dict | None:
 
 
 def fetch_bist(tickers: list[str]) -> list[dict]:
-    out = []
-    for t in tickers:
-        q = fetch_yahoo_quote(f"{t}.IS")
+    if not tickers:
+        return []
+    out: list[dict] = []
+    # Paralel: her ticker icin yahoo cagrisi ayri thread
+    futures = {_md_executor.submit(fetch_yahoo_quote, f"{t}.IS"): t for t in tickers}
+    for fut in as_completed(futures):
+        t = futures[fut]
+        try:
+            q = fut.result()
+        except Exception:
+            q = None
         if q and q.get("price") is not None:
             q["ticker"] = t
             out.append(q)
@@ -264,9 +308,19 @@ def fetch_bist(tickers: list[str]) -> list[dict]:
 
 
 def fetch_index(codes: list[str]) -> list[dict]:
-    out = []
-    for c in codes:
-        q = fetch_yahoo_quote(f"^{c}") or fetch_yahoo_quote(f"{c}.IS")
+    if not codes:
+        return []
+    out: list[dict] = []
+
+    def _one(c: str):
+        return c, (fetch_yahoo_quote(f"^{c}") or fetch_yahoo_quote(f"{c}.IS"))
+
+    futures = [_md_executor.submit(_one, c) for c in codes]
+    for fut in as_completed(futures):
+        try:
+            c, q = fut.result()
+        except Exception:
+            continue
         if q and q.get("price") is not None:
             q["index"] = c
             out.append(q)
@@ -304,41 +358,56 @@ def build_market_context(question: str) -> str | None:
 
     lines: list[str] = []
 
-    # Endeksler (BIST 100 vb.)
+    # --- 4 farkli kaynagi PARALEL cek (toplam latency = en yavas olan) ---
+    futures = {}
     if ents["index"]:
-        for row in fetch_index(ents["index"]):
-            lines.append(
-                f"- {row['index']}: {_fmt_num(row['price'])} "
-                f"({_fmt_pct(row['change_pct'])})"
-            )
+        futures["index"] = _md_executor.submit(fetch_index, ents["index"])
+    if ents["bist"]:
+        futures["bist"] = _md_executor.submit(fetch_bist, ents["bist"])
+    if ents["crypto"]:
+        futures["crypto"] = _md_executor.submit(fetch_crypto, ents["crypto"])
+    if ents["fx"]:
+        futures["fx"] = _md_executor.submit(fetch_fx, ents["fx"])
+
+    results: dict[str, list[dict]] = {}
+    for name, fut in futures.items():
+        try:
+            results[name] = fut.result(timeout=5.0) or []
+        except Exception as e:
+            print(f"[market_data] {name} fetch hata: {e}")
+            results[name] = []
+
+    # Endeksler (BIST 100 vb.)
+    for row in results.get("index", []):
+        lines.append(
+            f"- {row['index']}: {_fmt_num(row['price'])} "
+            f"({_fmt_pct(row['change_pct'])})"
+        )
 
     # BIST hisseleri
-    if ents["bist"]:
-        for row in fetch_bist(ents["bist"]):
-            lines.append(
-                f"- {row['ticker']} (BIST): {_fmt_num(row['price'])} TL "
-                f"({_fmt_pct(row['change_pct'])})"
-            )
+    for row in results.get("bist", []):
+        lines.append(
+            f"- {row['ticker']} (BIST): {_fmt_num(row['price'])} TL "
+            f"({_fmt_pct(row['change_pct'])})"
+        )
 
     # Kripto
-    if ents["crypto"]:
-        for row in fetch_crypto(ents["crypto"]):
-            usd = row.get("usd")
-            try_ = row.get("try")
-            chg = row.get("change_24h")
-            parts = []
-            if usd is not None:
-                parts.append(f"{_fmt_num(usd, 4 if usd < 1 else 2)} USD")
-            if try_ is not None:
-                parts.append(f"{_fmt_num(try_, 4 if try_ < 1 else 2)} TL")
-            if chg is not None:
-                parts.append(f"24s: {_fmt_pct(chg)}")
-            lines.append(f"- {row['id'].upper()}: " + " | ".join(parts))
+    for row in results.get("crypto", []):
+        usd = row.get("usd")
+        try_ = row.get("try")
+        chg = row.get("change_24h")
+        parts = []
+        if usd is not None:
+            parts.append(f"{_fmt_num(usd, 4 if usd < 1 else 2)} USD")
+        if try_ is not None:
+            parts.append(f"{_fmt_num(try_, 4 if try_ < 1 else 2)} TL")
+        if chg is not None:
+            parts.append(f"24s: {_fmt_pct(chg)}")
+        lines.append(f"- {row['id'].upper()}: " + " | ".join(parts))
 
     # Döviz
-    if ents["fx"]:
-        for row in fetch_fx(ents["fx"]):
-            lines.append(f"- 1 {row['code']} = {_fmt_num(row['try'], 4)} TL")
+    for row in results.get("fx", []):
+        lines.append(f"- 1 {row['code']} = {_fmt_num(row['try'], 4)} TL")
 
     if not lines:
         return None

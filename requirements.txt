@@ -3,8 +3,21 @@ flask>=3.0.0
 flask-cors>=4.0.0
 gunicorn>=21.0.0
 
-# Groq API (Llama 3.3 70B - Ücretsiz)
+# Groq API (Llama 3.3 70B - Ucretsiz)
 groq>=0.4.2
+
+# Opsiyonel: Redis cache (REDIS_URL env varsa kullanilir, yoksa in-memory fallback)
+redis>=5.0.0
+
+# HTTP client (market_data icin keep-alive + gzip; yoksa urllib fallback)
+requests>=2.31.0
+
+# Rate limiting (REDIS_URL varsa redis, yoksa memory storage)
+flask-limiter>=3.5.0
+
+# Observability (opsiyonel; kurulu degilse no-op fallback ile devre disi kalir)
+prometheus-flask-exporter>=0.23.0
+sentry-sdk[flask]>=1.40.0
 
 # Opsiyonel - Eski TensorFlow modelleri için
 # transformers>=4.36.0
