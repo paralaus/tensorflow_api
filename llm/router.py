@@ -135,8 +135,32 @@ class LlmRouter:
         if resp.status_code >= 400:
             raise RuntimeError(f"{url} -> {resp.status_code} {resp.text[:300]}")
         data = resp.json()
-        text = (((data.get("choices") or [{}])[0].get("message") or {}).get("content")) or ""
+        msg = ((data.get("choices") or [{}])[0].get("message")) or {}
+        content = msg.get("content")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            # Some providers (and some models) return structured content blocks.
+            # Normalize to plain text for downstream code.
+            parts: List[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    if part:
+                        parts.append(part)
+                elif isinstance(part, dict):
+                    txt = part.get("text")
+                    if isinstance(txt, str) and txt:
+                        parts.append(txt)
+            text = "".join(parts)
+        elif isinstance(content, dict):
+            txt = content.get("text")
+            if isinstance(txt, str):
+                text = txt
         usage = data.get("usage") or {}
+        if not isinstance(text, str) or not text.strip():
+            # Treat empty content as provider failure so router can fail over.
+            raise RuntimeError(f"{url} -> empty content in successful response")
         return {
             "text": text,
             "model": data.get("model") or model,

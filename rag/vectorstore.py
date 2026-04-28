@@ -67,6 +67,9 @@ def _ensure_client():
 
 
 def is_ready() -> bool:
+    # Lazy-init oldugu icin ilk cagri da readiness'i gercekci gormeli.
+    # Aksi halde ingest worker her zaman "hazir degil" deyip upsert'i atlar.
+    _ensure_client()
     return _client is not None and not _DISABLED
 
 

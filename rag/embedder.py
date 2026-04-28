@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import os
 import threading
+import logging
 from typing import Optional
 
 MODEL_NAME = os.environ.get("RAG_EMBED_MODEL", "paraphrase-multilingual-MiniLM-L12-v2")
 NORMALIZE = os.environ.get("RAG_EMBED_NORMALIZE", "1") == "1"  # cosine icin normalize
+HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 
 _model = None
 _dim: Optional[int] = None
@@ -41,11 +43,20 @@ def _ensure_loaded():
         try:
             # CPU'da calistir - GPU yoksa otomatik dusurur ama daha hizli init icin acik:
             os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+            # HF Hub warning log flood'unu azalt (token varsa zaten auth'li gider).
+            logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
             from sentence_transformers import SentenceTransformer  # type: ignore
 
             print(f"[rag/embedder] Model yukleniyor: {MODEL_NAME} ...")
-            _model = SentenceTransformer(MODEL_NAME, device="cpu")
-            _dim = _model.get_sentence_embedding_dimension()
+            st_kwargs = {"device": "cpu"}
+            if HF_TOKEN:
+                st_kwargs["token"] = HF_TOKEN
+            _model = SentenceTransformer(MODEL_NAME, **st_kwargs)
+            # Backward compatibility across sentence-transformers versions.
+            if hasattr(_model, "get_embedding_dimension"):
+                _dim = _model.get_embedding_dimension()
+            else:
+                _dim = _model.get_sentence_embedding_dimension()
             print(f"[rag/embedder] OK (dim={_dim})")
         except ImportError:
             print("[rag/embedder] sentence-transformers yuklu degil, RAG embedding devre disi.")
