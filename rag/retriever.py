@@ -20,9 +20,9 @@ from . import embedder, vectorstore as vs
 
 # Hangi koleksiyonlardan cekecegimiz (env ile override edilebilir).
 COLLECTIONS = [c.strip() for c in os.environ.get("RAG_COLLECTIONS", "kap,financials").split(",") if c.strip()]
-TOP_K_PER_COLLECTION = int(os.environ.get("RAG_TOP_K", "2"))
+TOP_K_PER_COLLECTION = int(os.environ.get("RAG_TOP_K", "4"))
 MIN_RELEVANCE_SIMILARITY = float(os.environ.get("RAG_MIN_SIM", "0.35"))  # cosine sim altinda dropla
-MAX_CONTEXT_CHARS = int(os.environ.get("RAG_MAX_CTX", "1200"))
+MAX_CONTEXT_CHARS = int(os.environ.get("RAG_MAX_CTX", "2200"))
 
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="rag")
 

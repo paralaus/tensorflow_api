@@ -188,11 +188,90 @@ _ACTION_MAP: List[Tuple[str, Dict[str, str]]] = [
     ("dividend", {"label": "Temettu Takvimi",   "icon": "💰", "action": "dividendCalendar"}),
 ]
 
+# Intent -> takip soru onerileri (merkezi yonetim)
+_FOLLOWUP_MAP: Dict[str, List[str]] = {
+    "stocks": [
+        "Bu konu icin sektor bazli dagilimi de gostereyim mi?",
+        "Ayni hissede kisa ve uzun vade senaryosunu karsilastirayim mi?",
+    ],
+    "analysis": [
+        "Teknik seviyeleri (destek/direnc) madde madde cikarayim mi?",
+        "Bu analiz icin riskli ve guvenli senaryoyu ayirayim mi?",
+    ],
+    "compare": [
+        "Iki secenegi temel ve teknik acidan yan yana karsilastirayim mi?",
+        "Hangi kriterlerle karar verebilecegini adim adim aciklayayim mi?",
+    ],
+    "crypto": [
+        "BTC ve ETH icin kisa teknik gorunumu karsilastirayim mi?",
+        "Kriptoda risk yonetimi icin ornek plan vereyim mi?",
+    ],
+    "fx": [
+        "Kur hareketinin borsaya olasi etkisini de acayim mi?",
+        "Kisa vadede izlenebilecek kritik seviyeleri vereyim mi?",
+    ],
+    "news": [
+        "Bu haberin sirket ve sektor uzerindeki olasi etkisini acayim mi?",
+        "Benzer gecmis KAP aciklamalariyla karsilastirayim mi?",
+    ],
+    "dividend": [
+        "Temettu takvimini ve olasi verimliligi birlikte hesaplayayim mi?",
+        "Bedelli/bedelsiz etkisini hisse fiyati acisindan aciklayayim mi?",
+    ],
+}
+
 
 def generate_actions(question: str) -> List[Dict[str, str]]:
     """Soruya gore aksiyon butonlari uret - intent tabanli, TR morfoloji-aware."""
     intents = detect_intents(question)
     return [meta for key, meta in _ACTION_MAP if key in intents]
+
+
+def generate_followups(
+    question: str,
+    ai_text: str = "",
+    detail_level: str = "standard",
+) -> List[str]:
+    """Intent merkezli takip soru onerileri uretir.
+
+    - Soru + cevap metninden intent cikarir.
+    - Intent'e gore 2-4 tane yonlendirici follow-up doner.
+    - detail_level'e gore genel bir next-step onerisi ekler.
+    """
+    haystack = f"{question or ''}\n{ai_text or ''}".strip()
+    # Kuralsal + semantik fallback (embedder hazirsa)
+    intents = detect_intents_semantic(haystack)
+    ordered_intents = [k for k, _ in _ACTION_MAP if k in intents]
+
+    out: List[str] = []
+
+    def _push(v: str):
+        if v and v not in out:
+            out.append(v)
+
+    for intent in ordered_intents:
+        for item in _FOLLOWUP_MAP.get(intent, []):
+            _push(item)
+            if len(out) >= 3:
+                break
+        if len(out) >= 3:
+            break
+
+    if detail_level == "brief":
+        _push("Bunu daha detayli ve bolumlu anlatmami ister misin?")
+    elif detail_level == "deep":
+        _push("Bu analizi tek bir hisse uzerinden ornekleyeyim mi?")
+    else:
+        _push("Istersen bunu adim adim bir izleme planina cevirebilirim.")
+
+    if not out:
+        out = [
+            "Bunu daha somut bir ornek uzerinden acmamı ister misin?",
+            "Kisa ve uzun vade etkisini ayri ayri anlatayim mi?",
+            "Riskleri onceleyip bir eylem listesi cikarayim mi?",
+        ]
+
+    return out[:4]
 
 
 # ---------- OPSIYONEL: SEMANTIK FALLBACK ----------
