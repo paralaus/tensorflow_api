@@ -29,8 +29,8 @@ const io = socketIo(server, {
 // Configuration
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || 'thisisasamplesecret';
-const MEDIASOUP_MIN_PORT = parseInt(process.env.MEDIASOUP_MIN_PORT) || 10000;
-const MEDIASOUP_MAX_PORT = parseInt(process.env.MEDIASOUP_MAX_PORT) || 10100;
+const MEDIASOUP_MIN_PORT = parseInt(process.env.MEDIASOUP_MIN_PORT, 10) || 10000;
+const MEDIASOUP_MAX_PORT = parseInt(process.env.MEDIASOUP_MAX_PORT, 10) || 10100;
 const MEDIASOUP_LISTEN_IP = process.env.MEDIASOUP_LISTEN_IP || '0.0.0.0';
 const MEDIASOUP_ANNOUNCED_IP = process.env.MEDIASOUP_ANNOUNCED_IP || '127.0.0.1';
 
@@ -225,7 +225,7 @@ conferenceNsp.on('connection', (socket) => {
   socket.on('join-room', async (data, callback) => {
     // Handle both roomId and roomName (mobile app uses roomName)
     const roomId = data.roomId || data.roomName;
-    const { userName, isCameraOn, isMicrophoneOn } = data;
+    const { userName } = data;
     
     if (!roomId) {
         console.error('join-room: Missing roomId/roomName');
@@ -526,7 +526,7 @@ conferenceNsp.on('connection', (socket) => {
       }
   });
 
-  socket.on('sfu:resume-consumer', async ({ consumerId }, callback) => {
+  socket.on('sfu:resume-consumer', async ({ consumerId: _consumerId }, callback) => {
       if (callback) callback({ resumed: true });
   });
 
@@ -545,7 +545,7 @@ conferenceNsp.on('connection', (socket) => {
     cb({ rtpCapabilities: room.router.rtpCapabilities });
   });
 
-  socket.on('createWebRtcTransport', async ({ consumer }, callback) => {
+  socket.on('createWebRtcTransport', async ({ consumer: _consumer }, callback) => {
     try {
         let room;
         for (const r of rooms.values()) {
@@ -694,7 +694,7 @@ conferenceNsp.on('connection', (socket) => {
       }
   });
 
-  socket.on('resumeConsumer', async ({ consumerId, consumer_id }, callback) => {
+  socket.on('resumeConsumer', async ({ consumerId: _consumerId, consumer_id: _consumer_id }, callback) => {
       if (typeof callback === 'function') callback({ resumed: true });
   });
 
@@ -1068,16 +1068,34 @@ function runFfmpegHls(inputPath, outputDir, segmentDurationSeconds = 6) {
       '-y',
       '-i',
       inputPath,
+      '-c:v',
+      'libx264',
       '-profile:v',
-      'baseline',
+      'main',
       '-level',
-      '3.0',
+      '4.0',
+      '-preset',
+      'veryfast',
+      '-crf',
+      '23',
+      '-pix_fmt',
+      'yuv420p',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '128k',
+      '-ac',
+      '2',
+      '-movflags',
+      '+faststart',
       '-start_number',
       '0',
       '-hls_time',
       String(segmentDurationSeconds),
       '-hls_list_size',
       '0',
+      '-hls_playlist_type',
+      'vod',
       '-f',
       'hls',
       path.join(outputDir, 'index.m3u8'),
@@ -1152,6 +1170,172 @@ app.post('/hls/from-url', async (req, res) => {
   } catch (err) {
     console.error('HLS conversion error', err);
     return res.status(500).json({ error: 'hls_conversion_failed' });
+  }
+});
+
+// --- Audio transcode (in-place size/bitrate optimization, no HLS) ---
+// Backwards compatible: returns a plain m4a/aac URL that any HTML5 <audio>
+// or react-native-audio-recorder-player can play directly.
+function runFfmpegAudioTranscode(inputPath, outputPath, bitrateKbps = 64) {
+  return new Promise((resolve, reject) => {
+    let stderrBuffer = '';
+    const args = [
+      '-y',
+      '-i',
+      inputPath,
+      '-vn',
+      '-c:a',
+      'aac',
+      '-b:a',
+      `${bitrateKbps}k`,
+      '-ac',
+      '1',
+      '-ar',
+      '44100',
+      '-movflags',
+      '+faststart',
+      '-f',
+      'mp4',
+      outputPath,
+    ];
+
+    const ffmpeg = spawn('ffmpeg', args);
+
+    ffmpeg.stderr.on('data', (data) => {
+      const text = data.toString();
+      stderrBuffer += text;
+      // Quieter than HLS path; only log on error close
+    });
+
+    ffmpeg.on('error', (err) => {
+      reject(err);
+    });
+
+    ffmpeg.on('close', (code) => {
+      if (code === 0) {
+        const durationSeconds = parseFfmpegDuration(stderrBuffer);
+        resolve({ durationSeconds });
+      } else {
+        console.error(`[ffmpeg-audio] exited with code ${code}: ${stderrBuffer}`);
+        reject(new Error(`ffmpeg exited with code ${code}`));
+      }
+    });
+  });
+}
+
+app.post('/audio/transcode/from-url', async (req, res) => {
+  const {
+    url,
+    channelId,
+    messageId,
+    minDurationSeconds,
+    minSizeBytes,
+    bitrateKbps,
+  } = req.body || {};
+
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'url_required' });
+  }
+
+  const minDuration =
+    typeof minDurationSeconds === 'number' && minDurationSeconds >= 0
+      ? minDurationSeconds
+      : 30;
+  const minSize =
+    typeof minSizeBytes === 'number' && minSizeBytes >= 0
+      ? minSizeBytes
+      : 256 * 1024; // 256 KB
+  const bitrate =
+    typeof bitrateKbps === 'number' && bitrateKbps >= 16 && bitrateKbps <= 320
+      ? bitrateKbps
+      : 64;
+
+  let workDir;
+  try {
+    workDir = await createTempDirectory('hissechat-audio');
+    const sourcePath = path.join(workDir, 'source.bin');
+    const outputPath = path.join(workDir, 'out.m4a');
+
+    await downloadFile(url, sourcePath);
+
+    const sourceStat = await fs.promises.stat(sourcePath);
+
+    // Probe duration via a no-op ffmpeg pass on the source so we can decide
+    // whether transcoding is worth it before actually re-encoding.
+    let originalDuration = null;
+    try {
+      const probeStderr = await new Promise((resolve, reject) => {
+        const ff = spawn('ffmpeg', ['-i', sourcePath, '-f', 'null', '-']);
+        let buf = '';
+        ff.stderr.on('data', (d) => {
+          buf += d.toString();
+        });
+        ff.on('error', reject);
+        ff.on('close', () => resolve(buf));
+      });
+      originalDuration = parseFfmpegDuration(probeStderr);
+    } catch (probeErr) {
+      console.warn('[audio-transcode] probe failed, continuing:', probeErr.message);
+    }
+
+    // Skip conditions: too short or too small to be worth optimizing.
+    if (
+      (originalDuration !== null && originalDuration < minDuration) ||
+      sourceStat.size < minSize
+    ) {
+      return res.json({
+        skipped: true,
+        reason: 'below_threshold',
+        durationSeconds: originalDuration,
+        originalSize: sourceStat.size,
+      });
+    }
+
+    const { durationSeconds } = await runFfmpegAudioTranscode(
+      sourcePath,
+      outputPath,
+      bitrate,
+    );
+
+    const outStat = await fs.promises.stat(outputPath);
+
+    // If transcode didn't actually shrink the file, skip the replace.
+    // Use a 5% margin to avoid flapping for already-optimized inputs.
+    if (outStat.size >= sourceStat.size * 0.95) {
+      return res.json({
+        skipped: true,
+        reason: 'no_size_gain',
+        durationSeconds: durationSeconds || originalDuration,
+        originalSize: sourceStat.size,
+        transcodedSize: outStat.size,
+      });
+    }
+
+    const baseKey =
+      channelId && messageId
+        ? `audio/channel/${channelId}/${messageId}.m4a`
+        : `audio/misc/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.m4a`;
+
+    const newUrl = await uploadFileToSpaces(outputPath, baseKey, 'audio/mp4');
+
+    return res.json({
+      skipped: false,
+      url: newUrl,
+      durationSeconds: durationSeconds || originalDuration,
+      originalSize: sourceStat.size,
+      transcodedSize: outStat.size,
+    });
+  } catch (err) {
+    console.error('Audio transcode error', err);
+    return res.status(500).json({ error: 'audio_transcode_failed' });
+  } finally {
+    if (workDir) {
+      try {
+        await fs.promises.rm(workDir, { recursive: true, force: true });
+      } catch (cleanupError) {
+        console.error('Audio transcode temp cleanup error', cleanupError);
+      }
+    }
   }
 });
 

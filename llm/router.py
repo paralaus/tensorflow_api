@@ -14,7 +14,7 @@ class LlmRouter:
     def __init__(self) -> None:
         self.provider_order = [
             p.strip().lower()
-            for p in os.environ.get("LLM_PROVIDER_ORDER", "groq,together,openai,anthropic").split(",")
+            for p in os.environ.get("LLM_PROVIDER_ORDER", "groq,together,deepseek,openai,anthropic").split(",")
             if p.strip()
         ]
         self.failover_enabled = os.environ.get("LLM_FAILOVER_ENABLED", "true").lower() == "true"
@@ -26,6 +26,7 @@ class LlmRouter:
         self.models = {
             "groq": os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
             "together": os.environ.get("TOGETHER_MODEL", "meta-llama/Llama-3.3-70B-Instruct-Turbo"),
+            "deepseek": os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
             "openai": os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
             "anthropic": os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
         }
@@ -44,6 +45,7 @@ class LlmRouter:
         self.keys = {
             "groq": os.environ.get("GROQ_API_KEY"),
             "together": os.environ.get("TOGETHER_API_KEY"),
+            "deepseek": os.environ.get("DEEPSEEK_API_KEY"),
             "openai": os.environ.get("OPENAI_API_KEY"),
             "anthropic": os.environ.get("ANTHROPIC_API_KEY"),
         }
@@ -107,7 +109,7 @@ class LlmRouter:
         if level not in ("brief", "standard", "deep"):
             level = "standard"
         provider, model = self.detail_routes.get(level, (None, None))
-        if provider and stream and provider not in ("groq", "together", "openai", "anthropic"):
+        if provider and stream and provider not in ("groq", "together", "deepseek", "openai", "anthropic"):
             return None, None
         return provider, model
 
@@ -334,6 +336,16 @@ class LlmRouter:
                 temperature=temperature,
                 top_p=top_p,
             )
+        if provider == "deepseek":
+            return self._openai_compatible_chat(
+                base_url="https://api.deepseek.com/v1",
+                api_key=key,
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+            )
         if provider == "openai":
             return self._openai_compatible_chat(
                 base_url="https://api.openai.com/v1",
@@ -457,6 +469,18 @@ class LlmRouter:
             )
             return
 
+        if provider == "deepseek":
+            yield from self._stream_openai_compatible(
+                base_url="https://api.deepseek.com/v1",
+                api_key=key,
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+            )
+            return
+
         if provider == "openai":
             yield from self._stream_openai_compatible(
                 base_url="https://api.openai.com/v1",
@@ -541,7 +565,7 @@ class LlmRouter:
         candidates = self._provider_candidates(preferred_provider)
         last_err: Optional[Exception] = None
         for provider in candidates:
-            if provider not in ("groq", "together", "openai", "anthropic"):
+            if provider not in ("groq", "together", "deepseek", "openai", "anthropic"):
                 continue
             if not self._is_enabled(provider):
                 continue
@@ -585,6 +609,7 @@ class LlmRouter:
             "streaming": {
                 "groq": bool(self._groq_stream_client) and bool(self.keys.get("groq")),
                 "together": bool(self.keys.get("together")),
+                "deepseek": bool(self.keys.get("deepseek")),
                 "openai": bool(self.keys.get("openai")),
                 "anthropic": bool(self.keys.get("anthropic")),
             },
