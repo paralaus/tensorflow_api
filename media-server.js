@@ -40,6 +40,27 @@ const SPACES_SECRET = process.env.SPACES_SECRET;
 const SPACES_BUCKET = process.env.SPACES_BUCKET;
 const SPACES_REGION = process.env.SPACES_REGION;
 
+function parseBooleanEnv(value, fallback = false) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
+}
+
+function parseIntegerEnv(value, fallback) {
+  const parsed = parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+const HLS_SEGMENT_DURATION_SECONDS = parseIntegerEnv(process.env.HLS_SEGMENT_DURATION_SECONDS, 6);
+const HLS_ENABLE_ABR = parseBooleanEnv(process.env.HLS_ENABLE_ABR, false);
+const HLS_GENERATE_THUMBNAIL = parseBooleanEnv(process.env.HLS_GENERATE_THUMBNAIL, true);
+const HLS_SEGMENT_TYPE =
+  String(process.env.HLS_SEGMENT_TYPE || 'mpegts').trim().toLowerCase() === 'fmp4'
+    ? 'fmp4'
+    : 'mpegts';
+
 let spacesClient;
 
 function getSpacesClient() {
@@ -1000,41 +1021,90 @@ function downloadFile(url, destinationPath) {
   });
 }
 
-async function uploadFileToSpaces(filePath, key, contentType) {
+async function uploadFileToSpaces(filePath, key, contentType, cacheControl) {
   const client = getSpacesClient();
   if (!client) {
     throw new Error('Spaces configuration is missing');
   }
   const body = await fs.promises.readFile(filePath);
-  await client.putObject({
+  const putParams = {
     Bucket: SPACES_BUCKET,
     Key: key,
     Body: body,
     ContentType: contentType || 'application/octet-stream',
     ACL: 'public-read',
-  });
+  };
+  if (cacheControl) {
+    putParams.CacheControl = cacheControl;
+  }
+  await client.putObject(putParams);
   return getSpacesUrl(key);
 }
 
-async function uploadHlsDirectoryToSpaces(dir, keyPrefix) {
-  const entries = await fs.promises.readdir(dir, { withFileTypes: true });
-  const files = entries.filter((entry) => entry.isFile());
+async function listFilesRecursively(rootDir, currentDir = rootDir) {
+  const entries = await fs.promises.readdir(currentDir, { withFileTypes: true });
+  const files = [];
+
+  for (const entry of entries) {
+    const fullPath = path.join(currentDir, entry.name);
+    if (entry.isDirectory()) {
+      const nestedFiles = await listFilesRecursively(rootDir, fullPath);
+      files.push(...nestedFiles);
+    } else if (entry.isFile()) {
+      const relativePath = path.relative(rootDir, fullPath).replace(/\\/g, '/');
+      files.push({ fullPath, relativePath });
+    }
+  }
+  return files;
+}
+
+function getHlsContentMetadata(relativePath) {
+  const ext = path.extname(relativePath).toLowerCase();
+  let contentType = 'application/octet-stream';
+  let cacheControl = 'public, max-age=31536000, immutable';
+
+  if (ext === '.m3u8') {
+    contentType = 'application/vnd.apple.mpegurl';
+    cacheControl = 'public, max-age=60';
+  } else if (ext === '.ts') {
+    contentType = 'video/MP2T';
+  } else if (ext === '.m4s') {
+    contentType = 'video/iso.segment';
+  } else if (ext === '.mp4') {
+    contentType = 'video/mp4';
+  } else if (ext === '.jpg' || ext === '.jpeg') {
+    contentType = 'image/jpeg';
+  }
+
+  return { contentType, cacheControl };
+}
+
+async function uploadHlsDirectoryToSpaces(dir, keyPrefix, artifact = {}) {
+  const files = await listFilesRecursively(dir);
+  const fileUrlMap = new Map();
+
   await Promise.all(
-    files.map(async (entry) => {
-      const fullPath = path.join(dir, entry.name);
-      const ext = path.extname(entry.name).toLowerCase();
-      let contentType = 'application/octet-stream';
-      if (ext === '.m3u8') {
-        contentType = 'application/vnd.apple.mpegurl';
-      } else if (ext === '.ts') {
-        contentType = 'video/MP2T';
-      }
-      const key = `${keyPrefix}/${entry.name}`;
-      await uploadFileToSpaces(fullPath, key, contentType);
+    files.map(async ({ fullPath, relativePath }) => {
+      const { contentType, cacheControl } = getHlsContentMetadata(relativePath);
+      const key = `${keyPrefix}/${relativePath}`;
+      const fileUrl = await uploadFileToSpaces(fullPath, key, contentType, cacheControl);
+      fileUrlMap.set(relativePath, fileUrl);
     })
   );
-  const playlistKey = `${keyPrefix}/index.m3u8`;
-  return getSpacesUrl(playlistKey);
+
+  const playlistRelativePath = artifact.playlistRelativePath || 'index.m3u8';
+  const masterPlaylistRelativePath = artifact.masterPlaylistRelativePath || null;
+  const fallbackPlaylistRelativePath = artifact.fallbackPlaylistRelativePath || 'index.m3u8';
+  const thumbnailRelativePath = artifact.thumbnailRelativePath || 'thumb.jpg';
+
+  return {
+    playlistUrl: fileUrlMap.get(playlistRelativePath) || null,
+    masterPlaylistUrl: masterPlaylistRelativePath
+      ? (fileUrlMap.get(masterPlaylistRelativePath) || null)
+      : null,
+    fallbackPlaylistUrl: fileUrlMap.get(fallbackPlaylistRelativePath) || null,
+    thumbnailUrl: fileUrlMap.get(thumbnailRelativePath) || null,
+  };
 }
 
 function parseFfmpegDuration(stderr) {
@@ -1061,45 +1131,180 @@ function parseFfmpegDuration(stderr) {
     : null;
 }
 
-function runFfmpegHls(inputPath, outputDir, segmentDurationSeconds = 6) {
+function runFfmpegHls(inputPath, outputDir, options = {}) {
   return new Promise((resolve, reject) => {
+    const segmentDurationSeconds = Math.max(
+      2,
+      parseIntegerEnv(options.segmentDurationSeconds, HLS_SEGMENT_DURATION_SECONDS),
+    );
+    const segmentType = options.segmentType === 'fmp4' ? 'fmp4' : 'mpegts';
+    const enableAbr = Boolean(options.enableAbr);
+    const segmentExt = segmentType === 'fmp4' ? 'm4s' : 'ts';
     let stderrBuffer = '';
-    const args = [
-      '-y',
-      '-i',
-      inputPath,
-      '-c:v',
-      'libx264',
-      '-profile:v',
-      'main',
-      '-level',
-      '4.0',
-      '-preset',
-      'veryfast',
-      '-crf',
-      '23',
-      '-pix_fmt',
-      'yuv420p',
-      '-c:a',
-      'aac',
-      '-b:a',
-      '128k',
-      '-ac',
-      '2',
-      '-movflags',
-      '+faststart',
-      '-start_number',
-      '0',
-      '-hls_time',
-      String(segmentDurationSeconds),
-      '-hls_list_size',
-      '0',
-      '-hls_playlist_type',
-      'vod',
-      '-f',
-      'hls',
-      path.join(outputDir, 'index.m3u8'),
-    ];
+    let args;
+    let artifact;
+
+    if (enableAbr) {
+      args = [
+        '-y',
+        '-i',
+        inputPath,
+        '-map',
+        '0:v:0',
+        '-map',
+        '0:a:0',
+        '-map',
+        '0:v:0',
+        '-map',
+        '0:a:0',
+        '-map',
+        '0:v:0',
+        '-map',
+        '0:a:0',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'veryfast',
+        '-profile:v',
+        'main',
+        '-level',
+        '4.0',
+        '-pix_fmt',
+        'yuv420p',
+        '-sc_threshold',
+        '0',
+        '-g',
+        '48',
+        '-keyint_min',
+        '48',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '128k',
+        '-ac',
+        '2',
+        '-filter:v:0',
+        'scale=-2:480',
+        '-filter:v:1',
+        'scale=-2:720',
+        '-filter:v:2',
+        'scale=-2:1080',
+        '-b:v:0',
+        '1000k',
+        '-maxrate:v:0',
+        '1070k',
+        '-bufsize:v:0',
+        '1500k',
+        '-b:v:1',
+        '2800k',
+        '-maxrate:v:1',
+        '2996k',
+        '-bufsize:v:1',
+        '4200k',
+        '-b:v:2',
+        '5000k',
+        '-maxrate:v:2',
+        '5350k',
+        '-bufsize:v:2',
+        '7500k',
+        '-var_stream_map',
+        'v:0,a:0,name:480p v:1,a:1,name:720p v:2,a:2,name:1080p',
+        '-master_pl_name',
+        'master.m3u8',
+        '-hls_time',
+        String(segmentDurationSeconds),
+        '-hls_list_size',
+        '0',
+        '-hls_playlist_type',
+        'vod',
+        '-hls_flags',
+        'independent_segments',
+      ];
+
+      if (segmentType === 'fmp4') {
+        args.push(
+          '-hls_segment_type',
+          'fmp4',
+          '-hls_fmp4_init_filename',
+          'v%v/init.mp4',
+        );
+      }
+
+      args.push(
+        '-hls_segment_filename',
+        path.join(outputDir, 'v%v', `segment_%06d.${segmentExt}`),
+        '-f',
+        'hls',
+        path.join(outputDir, 'v%v', 'index.m3u8'),
+      );
+
+      artifact = {
+        playlistRelativePath: 'master.m3u8',
+        masterPlaylistRelativePath: 'master.m3u8',
+        fallbackPlaylistRelativePath: 'v0/index.m3u8',
+        renditions: ['480p', '720p', '1080p'],
+      };
+    } else {
+      args = [
+        '-y',
+        '-i',
+        inputPath,
+        '-c:v',
+        'libx264',
+        '-profile:v',
+        'main',
+        '-level',
+        '4.0',
+        '-preset',
+        'veryfast',
+        '-crf',
+        '23',
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '128k',
+        '-ac',
+        '2',
+        '-movflags',
+        '+faststart',
+        '-start_number',
+        '0',
+        '-hls_time',
+        String(segmentDurationSeconds),
+        '-hls_list_size',
+        '0',
+        '-hls_playlist_type',
+        'vod',
+        '-hls_flags',
+        'independent_segments',
+      ];
+
+      if (segmentType === 'fmp4') {
+        args.push(
+          '-hls_segment_type',
+          'fmp4',
+          '-hls_fmp4_init_filename',
+          'init.mp4',
+        );
+      }
+
+      args.push(
+        '-hls_segment_filename',
+        path.join(outputDir, `segment_%06d.${segmentExt}`),
+        '-f',
+        'hls',
+        path.join(outputDir, 'index.m3u8'),
+      );
+
+      artifact = {
+        playlistRelativePath: 'index.m3u8',
+        masterPlaylistRelativePath: null,
+        fallbackPlaylistRelativePath: 'index.m3u8',
+        renditions: ['single'],
+      };
+    }
 
     const ffmpeg = spawn('ffmpeg', args);
 
@@ -1116,9 +1321,47 @@ function runFfmpegHls(inputPath, outputDir, segmentDurationSeconds = 6) {
     ffmpeg.on('close', (code) => {
       if (code === 0) {
         const durationSeconds = parseFfmpegDuration(stderrBuffer);
-        resolve({ durationSeconds });
+        resolve({
+          durationSeconds,
+          ...artifact,
+          segmentType,
+          abrEnabled: enableAbr,
+        });
       } else {
         reject(new Error(`ffmpeg exited with code ${code}`));
+      }
+    });
+  });
+}
+
+function runFfmpegThumbnail(inputPath, outputPath, seekSeconds = 1) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-y',
+      '-ss',
+      String(Math.max(0, seekSeconds)),
+      '-i',
+      inputPath,
+      '-frames:v',
+      '1',
+      '-q:v',
+      '2',
+      outputPath,
+    ];
+
+    const ffmpeg = spawn('ffmpeg', args);
+    let stderrBuffer = '';
+
+    ffmpeg.stderr.on('data', (data) => {
+      stderrBuffer += data.toString();
+    });
+
+    ffmpeg.on('error', (err) => reject(err));
+    ffmpeg.on('close', (code) => {
+      if (code === 0) {
+        resolve(true);
+      } else {
+        reject(new Error(`thumbnail ffmpeg exited with code ${code}: ${stderrBuffer}`));
       }
     });
   });
@@ -1140,17 +1383,30 @@ app.post('/hls/from-url', async (req, res) => {
     const hlsDir = path.join(workDir, 'hls');
     await ensureDirectory(hlsDir);
 
-    const { durationSeconds } = await runFfmpegHls(sourcePath, hlsDir, 6);
+    const hlsArtifact = await runFfmpegHls(sourcePath, hlsDir, {
+      segmentDurationSeconds: HLS_SEGMENT_DURATION_SECONDS,
+      segmentType: HLS_SEGMENT_TYPE,
+      enableAbr: HLS_ENABLE_ABR,
+    });
+
+    if (HLS_GENERATE_THUMBNAIL) {
+      try {
+        await runFfmpegThumbnail(sourcePath, path.join(hlsDir, 'thumb.jpg'), 1);
+        hlsArtifact.thumbnailRelativePath = 'thumb.jpg';
+      } catch (thumbErr) {
+        console.warn('[hls] thumbnail generation failed', thumbErr.message);
+      }
+    }
 
     const baseKey =
       channelId && messageId
         ? `hls/channel/${channelId}/${messageId}`
         : `hls/misc/${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-    let playlistUrl = null;
+    let uploadResult = null;
 
     try {
-      playlistUrl = await uploadHlsDirectoryToSpaces(hlsDir, baseKey);
+      uploadResult = await uploadHlsDirectoryToSpaces(hlsDir, baseKey, hlsArtifact);
     } finally {
       try {
         await fs.promises.rm(workDir, { recursive: true, force: true });
@@ -1159,13 +1415,19 @@ app.post('/hls/from-url', async (req, res) => {
       }
     }
 
-    if (!playlistUrl) {
+    if (!uploadResult?.playlistUrl) {
       return res.status(500).json({ error: 'hls_upload_failed' });
     }
 
     return res.json({
-      playlistUrl,
-      durationSeconds,
+      playlistUrl: uploadResult.playlistUrl,
+      masterPlaylistUrl: uploadResult.masterPlaylistUrl,
+      fallbackPlaylistUrl: uploadResult.fallbackPlaylistUrl,
+      thumbnailUrl: uploadResult.thumbnailUrl,
+      durationSeconds: hlsArtifact.durationSeconds,
+      abrEnabled: hlsArtifact.abrEnabled,
+      segmentType: hlsArtifact.segmentType,
+      renditions: hlsArtifact.renditions,
     });
   } catch (err) {
     console.error('HLS conversion error', err);
