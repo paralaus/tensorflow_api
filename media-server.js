@@ -56,10 +56,15 @@ function parseIntegerEnv(value, fallback) {
 const HLS_SEGMENT_DURATION_SECONDS = parseIntegerEnv(process.env.HLS_SEGMENT_DURATION_SECONDS, 6);
 const HLS_ENABLE_ABR = parseBooleanEnv(process.env.HLS_ENABLE_ABR, false);
 const HLS_GENERATE_THUMBNAIL = parseBooleanEnv(process.env.HLS_GENERATE_THUMBNAIL, true);
+const MEDIASOUP_ENABLE_VP9 = parseBooleanEnv(process.env.MEDIASOUP_ENABLE_VP9, true);
 const HLS_SEGMENT_TYPE =
   String(process.env.HLS_SEGMENT_TYPE || 'mpegts').trim().toLowerCase() === 'fmp4'
     ? 'fmp4'
     : 'mpegts';
+const LIVE_HLS_BASE_URL =
+  String(process.env.LIVE_HLS_BASE_URL || '').trim()
+  || String(process.env.MEDIA_PUBLIC_BASE_URL || '').trim()
+  || `http://localhost:${PORT}/live`;
 
 let spacesClient;
 
@@ -126,9 +131,25 @@ const mediasoupConfig = {
   },
   router: {
     mediaCodecs: [
-      { kind: 'audio', mimeType: 'audio/opus', clockRate: 48000, channels: 2 },
+      {
+        kind: 'audio',
+        mimeType: 'audio/opus',
+        clockRate: 48000,
+        channels: 2,
+        parameters: {
+          useinbandfec: 1,
+          usedtx: 1,
+          stereo: 1,
+          'sprop-stereo': 1,
+          maxplaybackrate: 48000,
+        },
+      },
       // VP8 (Genel uyumluluk için)
       { kind: 'video', mimeType: 'video/VP8', clockRate: 90000, parameters: { 'x-google-start-bitrate': 1000 } },
+      // VP9 (Daha iyi sıkıştırma, cihaz destekliyse otomatik tercih edilebilir)
+      ...(MEDIASOUP_ENABLE_VP9
+        ? [{ kind: 'video', mimeType: 'video/VP9', clockRate: 90000, parameters: { 'profile-id': 0, 'x-google-start-bitrate': 1000 } }]
+        : []),
       // H264 Constrained Baseline Profile Level 3.1 (Packetization Mode 1)
       { kind: 'video', mimeType: 'video/H264', clockRate: 90000, parameters: { 'packetization-mode': 1, 'profile-level-id': '42e01f', 'level-asymmetry-allowed': 1, 'x-google-start-bitrate': 1000 } },
       // H264 Constrained Baseline Profile Level 3.1 (Packetization Mode 0 - Bazı eski Androidler için)
@@ -154,6 +175,7 @@ const rooms = new Map(); // roomId -> { router, peers: Map<socketId, { transport
 const socketRoomMap = new Map(); // socketId -> roomId
 const typingUsersByRoom = new Map(); // roomId -> Set<userId>
 const roomHostByRoom = new Map(); // roomId -> host userId (first joiner fallback)
+const liveBroadcastSessions = new Map(); // roomId -> { sessionId, roomId, hlsUrl, playbackUrl, ... }
 
 // Initialize Mediasoup Workers
 async function runMediasoupWorkers() {
@@ -1366,6 +1388,38 @@ function runFfmpegThumbnail(inputPath, outputPath, seekSeconds = 1) {
     });
   });
 }
+
+app.post('/live-broadcast/session', async (req, res) => {
+  const { roomId, title, channelId, startTime, scheduledEndTime } = req.body || {};
+  const normalizedRoomId = String(roomId || '').trim() || `broadcast-${Date.now()}`;
+  const sessionId = `live-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const hlsUrl = `${LIVE_HLS_BASE_URL.replace(/\/$/, '')}/${encodeURIComponent(normalizedRoomId)}/index.m3u8`;
+
+  const session = {
+    sessionId,
+    roomId: normalizedRoomId,
+    title: String(title || 'Canli Yayin'),
+    channelId: channelId || null,
+    startTime: startTime || new Date().toISOString(),
+    scheduledEndTime: scheduledEndTime || null,
+    hlsUrl,
+    playbackUrl: hlsUrl,
+    llhls: true,
+    status: 'provisioned',
+    createdAt: new Date().toISOString(),
+  };
+
+  liveBroadcastSessions.set(normalizedRoomId, session);
+  return res.status(201).json(session);
+});
+
+app.get('/live-broadcast/session/:roomId', (req, res) => {
+  const roomId = String(req.params.roomId || '').trim();
+  if (!roomId || !liveBroadcastSessions.has(roomId)) {
+    return res.status(404).json({ error: 'live_broadcast_session_not_found' });
+  }
+  return res.json(liveBroadcastSessions.get(roomId));
+});
 
 app.post('/hls/from-url', async (req, res) => {
   const { url, channelId, messageId } = req.body || {};
