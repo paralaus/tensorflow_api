@@ -84,6 +84,355 @@ const SPACES_SECRET = process.env.SPACES_SECRET;
 const SPACES_BUCKET = process.env.SPACES_BUCKET;
 const SPACES_REGION = process.env.SPACES_REGION;
 
+// ============================================================================
+// LIVE HLS BROADCAST PIPELINE (PlainTransport -> FFmpeg -> HLS)
+// Ported from media-server.js so that the conference mediasoup router
+// (owned by this process) can feed FFmpeg directly.
+// ============================================================================
+
+function _parseIntEnv(value, fallback) {
+    const parsed = parseInt(value, 10);
+    return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+const LIVE_HLS_PORT = _parseIntEnv(process.env.PORT, 4000);
+const LIVE_HLS_DIR = process.env.LIVE_HLS_DIR
+    ? path.resolve(process.env.LIVE_HLS_DIR)
+    : path.join(__dirname, '..', 'public', 'live');
+try {
+    fs.mkdirSync(LIVE_HLS_DIR, { recursive: true });
+} catch (_) {}
+
+const LIVE_HLS_BASE_URL =
+    String(process.env.LIVE_HLS_BASE_URL || '').trim() ||
+    String(process.env.MEDIA_PUBLIC_BASE_URL || '').trim() ||
+    `http://localhost:${LIVE_HLS_PORT}/live`;
+
+const LIVE_RTP_PORT_BASE = _parseIntEnv(process.env.LIVE_RTP_PORT_BASE, 30000);
+const LIVE_RTP_PORT_MAX = _parseIntEnv(process.env.LIVE_RTP_PORT_MAX, 30400);
+const liveRtpPortInUse = new Set();
+const liveHlsPipelines = new Map(); // roomId -> pipeline
+const liveHlsCleanupTimers = new Map(); // roomId -> Timeout
+const liveBroadcastSessions = new Map(); // roomId -> session metadata
+
+function cancelLiveHlsCleanup(roomId, reason) {
+    const t = liveHlsCleanupTimers.get(roomId);
+    if (t) {
+        clearTimeout(t);
+        liveHlsCleanupTimers.delete(roomId);
+        log.info(`[live-hls ${roomId}] cleanup timer cancelled (${reason || 'restart'})`);
+    }
+}
+
+function allocLiveRtpPort() {
+    for (let p = LIVE_RTP_PORT_BASE; p <= LIVE_RTP_PORT_MAX; p++) {
+        if (!liveRtpPortInUse.has(p)) {
+            liveRtpPortInUse.add(p);
+            return p;
+        }
+    }
+    throw new Error('no_live_rtp_port_available');
+}
+
+function freeLiveRtpPort(p) {
+    if (typeof p === 'number') liveRtpPortInUse.delete(p);
+}
+
+function sanitizeRoomIdForPath(roomId) {
+    return String(roomId).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80) || 'room';
+}
+
+// Pick the first video (and optionally audio) producer in a Room.
+// Server.js uses Room (src/Room.js) with peers Map<socketId, Peer>;
+// each Peer (src/Peer.js) keeps `producers` as Map<producerId, producer>.
+function pickProducersForBroadcast(room) {
+    let videoProducer = null;
+    let audioProducer = null;
+    if (!room || !room.peers) return { videoProducer, audioProducer };
+    for (const peer of room.peers.values()) {
+        if (!peer || !peer.producers) continue;
+        const iter =
+            typeof peer.producers.values === 'function'
+                ? peer.producers.values()
+                : peer.producers;
+        for (const producer of iter) {
+            if (!producer || producer.closed) continue;
+            if (!videoProducer && producer.kind === 'video') videoProducer = producer;
+            if (!audioProducer && producer.kind === 'audio') audioProducer = producer;
+        }
+        if (videoProducer && audioProducer) break;
+    }
+    return { videoProducer, audioProducer };
+}
+
+function buildSdpForConsumers({ videoConsumer, videoPort, audioConsumer, audioPort }) {
+    const lines = [
+        'v=0',
+        'o=- 0 0 IN IP4 127.0.0.1',
+        's=mediasoup-live',
+        'c=IN IP4 127.0.0.1',
+        't=0 0',
+    ];
+
+    function appendMedia(kind, consumer, port) {
+        const codec = consumer.rtpParameters.codecs[0];
+        const pt = codec.payloadType;
+        const mime = codec.mimeType.split('/')[1];
+        const clockRate = codec.clockRate;
+        const channels = codec.channels && codec.channels > 1 ? `/${codec.channels}` : '';
+        lines.push(`m=${kind} ${port} RTP/AVP ${pt}`);
+        lines.push('a=rtcp-mux');
+        lines.push(`a=rtpmap:${pt} ${mime}/${clockRate}${channels}`);
+        const params = codec.parameters || {};
+        const fmtpParts = Object.entries(params)
+            .filter(([, v]) => v !== undefined && v !== null && v !== '')
+            .map(([k, v]) => `${k}=${v}`);
+        if (fmtpParts.length > 0) {
+            lines.push(`a=fmtp:${pt} ${fmtpParts.join(';')}`);
+        }
+        lines.push('a=sendonly');
+    }
+
+    appendMedia('video', videoConsumer, videoPort);
+    if (audioConsumer) {
+        appendMedia('audio', audioConsumer, audioPort);
+    }
+    return lines.join('\n') + '\n';
+}
+
+async function startLiveHlsForRoom(roomId) {
+    if (liveHlsPipelines.has(roomId)) return liveHlsPipelines.get(roomId);
+
+    const room = roomList.get(roomId);
+    if (!room) throw new Error(`live_hls_room_not_found:${roomId}`);
+
+    const { videoProducer, audioProducer } = pickProducersForBroadcast(room);
+    if (!videoProducer) return null;
+
+    const placeholder = { starting: true };
+    liveHlsPipelines.set(roomId, placeholder);
+
+    let videoTransport = null;
+    let audioTransport = null;
+    let videoConsumer = null;
+    let audioConsumer = null;
+    let videoPort = null;
+    let audioPort = null;
+    let ffmpeg = null;
+    const hlsDir = path.join(LIVE_HLS_DIR, sanitizeRoomIdForPath(roomId));
+
+    cancelLiveHlsCleanup(roomId, 'pipeline-start');
+
+    try {
+        await fs.promises.mkdir(hlsDir, { recursive: true });
+
+        let startNumber = 0;
+        let resumeFromExisting = false;
+        try {
+            const existing = await fs.promises.readdir(hlsDir);
+            let maxSeg = -1;
+            for (const f of existing) {
+                const m = f.match(/^seg_(\d+)\.ts$/);
+                if (m) {
+                    const n = parseInt(m[1], 10);
+                    if (Number.isFinite(n) && n > maxSeg) maxSeg = n;
+                }
+            }
+            if (maxSeg >= 0) {
+                startNumber = maxSeg + 1;
+                resumeFromExisting = true;
+                log.info(`[live-hls ${roomId}] resuming segment numbering at ${startNumber}`);
+            } else {
+                await Promise.all(
+                    existing.map((f) =>
+                        fs.promises.unlink(path.join(hlsDir, f)).catch(() => {}),
+                    ),
+                );
+            }
+        } catch (_) {}
+
+        const router = room.router;
+        const plainOpts = {
+            listenIp: { ip: '127.0.0.1', announcedIp: null },
+            rtcpMux: true,
+            comedia: false,
+            enableSrtp: false,
+        };
+
+        videoTransport = await router.createPlainTransport(plainOpts);
+        videoPort = allocLiveRtpPort();
+        await videoTransport.connect({ ip: '127.0.0.1', port: videoPort });
+        videoConsumer = await videoTransport.consume({
+            producerId: videoProducer.id,
+            rtpCapabilities: router.rtpCapabilities,
+            paused: true,
+        });
+
+        if (audioProducer) {
+            audioTransport = await router.createPlainTransport(plainOpts);
+            audioPort = allocLiveRtpPort();
+            await audioTransport.connect({ ip: '127.0.0.1', port: audioPort });
+            audioConsumer = await audioTransport.consume({
+                producerId: audioProducer.id,
+                rtpCapabilities: router.rtpCapabilities,
+                paused: true,
+            });
+        }
+
+        const sdp = buildSdpForConsumers({ videoConsumer, videoPort, audioConsumer, audioPort });
+        const sdpPath = path.join(hlsDir, 'input.sdp');
+        await fs.promises.writeFile(sdpPath, sdp, 'utf8');
+
+        const ffmpegArgs = [
+            '-loglevel', 'warning',
+            '-protocol_whitelist', 'file,udp,rtp',
+            '-fflags', '+genpts+nobuffer',
+            '-flags', 'low_delay',
+            '-probesize', '32',
+            '-analyzeduration', '0',
+            '-i', sdpPath,
+            '-map', '0:v:0',
+            ...(audioConsumer ? ['-map', '0:a:0'] : []),
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-tune', 'zerolatency',
+            '-profile:v', 'baseline',
+            '-level', '3.1',
+            '-pix_fmt', 'yuv420p',
+            '-g', '60',
+            '-keyint_min', '60',
+            '-sc_threshold', '0',
+            '-b:v', '1500k',
+            '-maxrate', '1800k',
+            '-bufsize', '3000k',
+            ...(audioConsumer
+                ? ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2']
+                : []),
+            '-f', 'hls',
+            '-hls_time', '2',
+            '-hls_list_size', '6',
+            '-hls_flags', resumeFromExisting
+                ? 'delete_segments+independent_segments+omit_endlist+program_date_time+append_list'
+                : 'delete_segments+independent_segments+omit_endlist+program_date_time',
+            '-hls_segment_type', 'mpegts',
+            '-start_number', String(startNumber),
+            '-hls_segment_filename', path.join(hlsDir, 'seg_%05d.ts'),
+            path.join(hlsDir, 'index.m3u8'),
+        ];
+
+        log.info(`[live-hls ${roomId}] spawning ffmpeg (videoPort=${videoPort}, audioPort=${audioPort ?? 'none'})`);
+        ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+        ffmpeg.stderr.on('data', (chunk) => {
+            const text = chunk.toString();
+            if (text.trim().length > 0) log.info(`[live-hls ${roomId}] ${text.trim()}`);
+        });
+        ffmpeg.on('error', (err) => {
+            log.error(`[live-hls ${roomId}] ffmpeg error:`, err.message);
+        });
+        ffmpeg.on('close', (code) => {
+            log.info(`[live-hls ${roomId}] ffmpeg exited code=${code}`);
+            stopLiveHlsForRoom(roomId).catch(() => {});
+        });
+
+        const pipeline = {
+            roomId,
+            hlsDir,
+            ffmpeg,
+            videoTransport,
+            audioTransport,
+            videoConsumer,
+            audioConsumer,
+            videoPort,
+            audioPort,
+            videoProducerId: videoProducer.id,
+            audioProducerId: audioProducer ? audioProducer.id : null,
+            startedAt: Date.now(),
+            stopping: false,
+        };
+        liveHlsPipelines.set(roomId, pipeline);
+
+        videoConsumer.on('producerclose', () => {
+            log.info(`[live-hls ${roomId}] video producer closed`);
+            stopLiveHlsForRoom(roomId).catch(() => {});
+        });
+        if (audioConsumer) {
+            audioConsumer.on('producerclose', () => {
+                log.info(`[live-hls ${roomId}] audio producer closed (continuing video-only)`);
+            });
+        }
+
+        await videoConsumer.resume();
+        if (audioConsumer) await audioConsumer.resume();
+
+        const session = liveBroadcastSessions.get(roomId);
+        if (session) {
+            session.status = 'live';
+            session.streamStartedAt = new Date().toISOString();
+        }
+
+        log.info(`[live-hls ${roomId}] pipeline started -> ${hlsDir}`);
+        return pipeline;
+    } catch (err) {
+        log.error(`[live-hls ${roomId}] start failed:`, err);
+        try { if (ffmpeg) ffmpeg.kill('SIGKILL'); } catch (_) {}
+        try { if (videoConsumer) videoConsumer.close(); } catch (_) {}
+        try { if (audioConsumer) audioConsumer.close(); } catch (_) {}
+        try { if (videoTransport) videoTransport.close(); } catch (_) {}
+        try { if (audioTransport) audioTransport.close(); } catch (_) {}
+        freeLiveRtpPort(videoPort);
+        freeLiveRtpPort(audioPort);
+        liveHlsPipelines.delete(roomId);
+        throw err;
+    }
+}
+
+async function stopLiveHlsForRoom(roomId) {
+    const p = liveHlsPipelines.get(roomId);
+    if (!p || p.starting === true) return;
+    if (p.stopping) return;
+    p.stopping = true;
+
+    try { if (p.ffmpeg && !p.ffmpeg.killed) p.ffmpeg.kill('SIGINT'); } catch (_) {}
+    setTimeout(() => {
+        try { if (p.ffmpeg && !p.ffmpeg.killed) p.ffmpeg.kill('SIGKILL'); } catch (_) {}
+    }, 3000);
+
+    try { if (p.videoConsumer && !p.videoConsumer.closed) p.videoConsumer.close(); } catch (_) {}
+    try { if (p.audioConsumer && !p.audioConsumer.closed) p.audioConsumer.close(); } catch (_) {}
+    try { if (p.videoTransport && !p.videoTransport.closed) p.videoTransport.close(); } catch (_) {}
+    try { if (p.audioTransport && !p.audioTransport.closed) p.audioTransport.close(); } catch (_) {}
+    freeLiveRtpPort(p.videoPort);
+    freeLiveRtpPort(p.audioPort);
+
+    liveHlsPipelines.delete(roomId);
+
+    const session = liveBroadcastSessions.get(roomId);
+    if (session) {
+        session.status = 'ended';
+        session.streamEndedAt = new Date().toISOString();
+    }
+
+    if (p.hlsDir) {
+        const cleanupTimer = setTimeout(() => {
+            liveHlsCleanupTimers.delete(roomId);
+            fs.rm(p.hlsDir, { recursive: true, force: true }, () => {});
+        }, 60 * 1000);
+        liveHlsCleanupTimers.set(roomId, cleanupTimer);
+    }
+    log.info(`[live-hls ${roomId}] pipeline stopped`);
+}
+
+function maybeStartLiveHlsForRoom(roomId) {
+    if (!roomId) return;
+    if (!roomList.has(roomId)) return;
+    if (!liveBroadcastSessions.has(roomId)) return;
+    if (liveHlsPipelines.has(roomId)) return;
+    startLiveHlsForRoom(roomId).catch((e) =>
+        log.error(`[live-hls ${roomId}] auto-start failed:`, e.message),
+    );
+}
+
 let spacesClient;
 
 function getSpacesClient() {
@@ -1064,6 +1413,89 @@ function startServer() {
         return res.end('`Yanlış imza` - Doğrulama başarısız oldu!');
     });
 
+    // ====================================================
+    // LIVE HLS BROADCAST ROUTES (must be registered BEFORE
+    // the catch-all `app.get('*')` so requests to
+    // `/live/<roomId>/...` and `/live-broadcast/*` are
+    // handled here instead of falling through to 404.html.
+    // ====================================================
+
+    // Serve generated HLS segments + playlists from disk.
+    app.use(
+        '/live',
+        express.static(LIVE_HLS_DIR, {
+            fallthrough: false,
+            setHeaders: (res, filePath) => {
+                res.setHeader('Access-Control-Allow-Origin', '*');
+                if (filePath.endsWith('.m3u8')) {
+                    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+                    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+                } else if (filePath.endsWith('.ts')) {
+                    res.setHeader('Cache-Control', 'public, max-age=10');
+                    res.setHeader('Content-Type', 'video/mp2t');
+                }
+            },
+        }),
+    );
+
+    // Register a broadcast session for a given roomId. Backend (PocketBase
+    // or Express app on :3000) calls this when the user creates a live
+    // broadcast. Once the broadcaster joins the mediasoup room and produces
+    // video, the HLS pipeline auto-starts.
+    app.post('/live-broadcast/session', async (req, res) => {
+        const { roomId, title, channelId, startTime, scheduledEndTime } = req.body || {};
+        const normalizedRoomId = String(roomId || '').trim() || `broadcast-${Date.now()}`;
+        const sessionId = `live-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const hlsUrl = `${LIVE_HLS_BASE_URL.replace(/\/$/, '')}/${encodeURIComponent(
+            normalizedRoomId,
+        )}/index.m3u8`;
+
+        const session = {
+            sessionId,
+            roomId: normalizedRoomId,
+            title: String(title || 'Canli Yayin'),
+            channelId: channelId || null,
+            startTime: startTime || new Date().toISOString(),
+            scheduledEndTime: scheduledEndTime || null,
+            hlsUrl,
+            playbackUrl: hlsUrl,
+            llhls: true,
+            status: 'provisioned',
+            createdAt: new Date().toISOString(),
+        };
+
+        liveBroadcastSessions.set(normalizedRoomId, session);
+
+        // If broadcaster already joined the mediasoup room before calling session, start now.
+        if (roomList.has(normalizedRoomId)) {
+            startLiveHlsForRoom(normalizedRoomId).catch((e) =>
+                log.error(`[live-hls ${normalizedRoomId}] start on session failed:`, e.message),
+            );
+        }
+
+        return res.status(201).json(session);
+    });
+
+    app.post('/live-broadcast/stop/:roomId', async (req, res) => {
+        const roomId = String(req.params.roomId || '').trim();
+        if (!roomId) return res.status(400).json({ error: 'roomId_required' });
+        await stopLiveHlsForRoom(roomId);
+        const session = liveBroadcastSessions.get(roomId);
+        if (session) {
+            session.status = 'ended';
+            session.streamEndedAt = new Date().toISOString();
+        }
+        return res.json({ ok: true, roomId });
+    });
+
+    app.get('/live-broadcast/session/:roomId', (req, res) => {
+        const roomId = String(req.params.roomId || '').trim();
+        if (!roomId || !liveBroadcastSessions.has(roomId)) {
+            return res.status(404).json({ error: 'live_broadcast_session_not_found' });
+        }
+        return res.json(liveBroadcastSessions.get(roomId));
+    });
+
     // daha önce hiçbir sayfayla eşleşmediğinden 404 bulunamadı
     app.get('*', function (req, res) {
         res.sendFile(views.notFound);
@@ -1577,6 +2009,15 @@ function startServer() {
                 callback({
                     producer_id,
                 });
+
+                // Auto-start the live HLS pipeline once the broadcaster
+                // produces video for a room that has a registered broadcast
+                // session. Idempotent — safe to call on every produce.
+                try {
+                    maybeStartLiveHlsForRoom(socket.room_id);
+                } catch (e) {
+                    log.error('maybeStartLiveHlsForRoom failed', e);
+                }
             } catch (err) {
                 log.error('Üretici aktarım hatası', err);
                 callback({
@@ -2400,6 +2841,7 @@ function startServer() {
 
             log.debug('[Disconnect] - katılımcı adı', peer_name);
 
+            const disconnectedRoomId = socket.room_id;
             room.removePeer(socket.id);
 
             if (room.getPeers().size === 0) {
@@ -2413,6 +2855,13 @@ function startServer() {
                 const activeRooms = getActiveRooms();
 
                 log.info('[Disconnect] - Son katılımcı - mevcut etkin odalar', activeRooms);
+
+                // Tear down live HLS pipeline when the last peer leaves.
+                // stopLiveHlsForRoom keeps the .m3u8 dir for a grace period
+                // so reconnecting broadcasters resume the same playlist.
+                stopLiveHlsForRoom(disconnectedRoomId).catch((e) =>
+                    log.error(`[live-hls ${disconnectedRoomId}] stop on disconnect failed:`, e.message),
+                );
             }
 
             room.broadCast(socket.id, 'removeMe', removeMeData(room, peer_name, isPresenter));
@@ -2439,6 +2888,7 @@ function startServer() {
 
             log.debug('Odadan Çık', peer_name);
 
+            const exitedRoomId = socket.room_id;
             room.removePeer(socket.id);
 
             room.broadCast(socket.id, 'removeMe', removeMeData(room, peer_name, isPresenter));
@@ -2454,6 +2904,10 @@ function startServer() {
                 const activeRooms = getActiveRooms();
 
                 log.info('[REMOVE ME] - Son katılımcı - mevcut etkin odalar', activeRooms);
+
+                stopLiveHlsForRoom(exitedRoomId).catch((e) =>
+                    log.error(`[live-hls ${exitedRoomId}] stop on exitRoom failed:`, e.message),
+                );
             }
 
             socket.room_id = null;
