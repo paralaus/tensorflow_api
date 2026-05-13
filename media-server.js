@@ -1782,9 +1782,17 @@ function maybeStartLiveHlsForSocketRoom(socket) {
   // Find roomId where socket is a peer.
   for (const [rid, r] of rooms.entries()) {
     if (r.peers.has(socket.id)) {
-      if (liveBroadcastSessions.has(rid) && !liveHlsPipelines.has(rid)) {
+      const hasSession = liveBroadcastSessions.has(rid);
+      const hasPipeline = liveHlsPipelines.has(rid);
+      if (hasSession && !hasPipeline) {
+        console.log(`[live-hls ${rid}] auto-start triggered (socket=${socket.id})`);
         startLiveHlsForRoom(rid).catch((e) =>
           console.error(`[live-hls ${rid}] auto-start failed:`, e.message)
+        );
+      } else if (!hasSession) {
+        console.log(
+          `[live-hls ${rid}] auto-start skipped: no session registered yet (socket=${socket.id}). ` +
+            `Sessions in map: ${liveBroadcastSessions.size}`
         );
       }
       return rid;
@@ -1816,6 +1824,13 @@ app.post('/live-broadcast/session', async (req, res) => {
   const normalizedRoomId = String(roomId || '').trim() || `broadcast-${Date.now()}`;
   const sessionId = `live-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const hlsUrl = `${LIVE_HLS_BASE_URL.replace(/\/$/, '')}/${encodeURIComponent(normalizedRoomId)}/index.m3u8`;
+
+  const existed = liveBroadcastSessions.has(normalizedRoomId);
+  const roomReady = rooms.has(normalizedRoomId);
+  console.log(
+    `[live-broadcast/session] register roomId=${normalizedRoomId} ` +
+      `existed=${existed} roomReady=${roomReady} channelId=${channelId || '-'}`
+  );
 
   const session = {
     sessionId,
@@ -1861,6 +1876,43 @@ app.get('/live-broadcast/session/:roomId', (req, res) => {
     return res.status(404).json({ error: 'live_broadcast_session_not_found' });
   }
   return res.json(liveBroadcastSessions.get(roomId));
+});
+
+// Debug: tüm canlı yayın durumunun anlık görünümü. Yayıncı yayını başlattı
+// ama izleyici "hazırlanıyor"da kalıyorsa burayı kontrol et:
+//   - sessions: liveBroadcastSessions map (backend veya client tarafından
+//     register edilmiş yayınlar). Boşsa media-server hiç bilgilendirilmemiş.
+//   - rooms: mediasoup oda map'i (yayıncı bağlandıysa burada görünür).
+//   - pipelines: aktif FFmpeg/HLS pipeline'ları (m3u8 üretiliyor demektir).
+// Bir oda `sessions` ve `rooms` içinde ama `pipelines` içinde yoksa,
+// maybeStartLiveHlsForSocketRoom henüz tetiklenmemiş olabilir.
+app.get('/live-broadcast/debug', (req, res) => {
+  const sessions = Array.from(liveBroadcastSessions.entries()).map(([rid, s]) => ({
+    roomId: rid,
+    sessionId: s.sessionId,
+    status: s.status,
+    channelId: s.channelId,
+    startTime: s.startTime,
+    streamEndedAt: s.streamEndedAt || null,
+    hasPipeline: liveHlsPipelines.has(rid),
+    hasRoom: rooms.has(rid),
+    peerCount: rooms.has(rid) ? rooms.get(rid).peers.size : 0,
+  }));
+  const orphanRooms = [];
+  for (const [rid, r] of rooms.entries()) {
+    if (!liveBroadcastSessions.has(rid)) {
+      orphanRooms.push({ roomId: rid, peerCount: r.peers.size });
+    }
+  }
+  return res.json({
+    now: new Date().toISOString(),
+    sessionCount: liveBroadcastSessions.size,
+    roomCount: rooms.size,
+    pipelineCount: liveHlsPipelines.size,
+    sessions,
+    pipelines: Array.from(liveHlsPipelines.keys()),
+    orphanRooms, // mediasoup'a katılmış ama session register edilmemiş odalar
+  });
 });
 
 app.post('/hls/from-url', async (req, res) => {
