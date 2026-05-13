@@ -370,6 +370,10 @@ conferenceNsp.on('connection', (socket) => {
         }
         
         if (room.peers.size === 0) {
+          // Stop live HLS pipeline if any
+          if (liveHlsPipelines.has(roomId)) {
+            stopLiveHlsForRoom(roomId).catch(() => {});
+          }
           room.router.close();
           rooms.delete(roomId);
           roomHostByRoom.delete(roomId);
@@ -503,6 +507,9 @@ conferenceNsp.on('connection', (socket) => {
         peer.producers.push(producer);
 
         producer.on('transportclose', () => producer.close());
+
+        // Auto-start live HLS pipeline if this room has a registered broadcast session.
+        try { maybeStartLiveHlsForSocketRoom(socket); } catch (_) {}
 
         // Notify others
         socket.to(Array.from(room.peers.keys())).emit('sfu:new-producer', {
@@ -663,6 +670,9 @@ conferenceNsp.on('connection', (socket) => {
         peer.producers.push(producer);
 
         producer.on('transportclose', () => producer.close());
+
+        // Auto-start live HLS pipeline if this room has a registered broadcast session.
+        try { maybeStartLiveHlsForSocketRoom(socket); } catch (_) {}
 
         // Notify others
         socket.to(Array.from(room.peers.keys())).emit('newProducers', [{
@@ -1389,6 +1399,339 @@ function runFfmpegThumbnail(inputPath, outputPath, seekSeconds = 1) {
   });
 }
 
+// ============================================================================
+// LIVE HLS BROADCAST PIPELINE (PlainTransport -> FFmpeg -> HLS)
+// ============================================================================
+
+const LIVE_HLS_DIR = process.env.LIVE_HLS_DIR
+  ? path.resolve(process.env.LIVE_HLS_DIR)
+  : path.join(__dirname, 'public', 'live');
+try { fs.mkdirSync(LIVE_HLS_DIR, { recursive: true }); } catch (_) {}
+
+const LIVE_RTP_PORT_BASE = parseIntegerEnv(process.env.LIVE_RTP_PORT_BASE, 30000);
+const LIVE_RTP_PORT_MAX = parseIntegerEnv(process.env.LIVE_RTP_PORT_MAX, 30400);
+const liveRtpPortInUse = new Set();
+const liveHlsPipelines = new Map(); // roomId -> { ffmpeg, transports, consumers, ports, hlsDir, starting, stopping }
+
+function allocLiveRtpPort() {
+  // Allocate pair (RTP + RTCP non-mux not used; we use rtcp-mux so single port).
+  for (let p = LIVE_RTP_PORT_BASE; p <= LIVE_RTP_PORT_MAX; p++) {
+    if (!liveRtpPortInUse.has(p)) {
+      liveRtpPortInUse.add(p);
+      return p;
+    }
+  }
+  throw new Error('no_live_rtp_port_available');
+}
+function freeLiveRtpPort(p) {
+  if (typeof p === 'number') liveRtpPortInUse.delete(p);
+}
+
+function sanitizeRoomIdForPath(roomId) {
+  return String(roomId).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80) || 'room';
+}
+
+function findRoomIdByRoom(targetRoom) {
+  for (const [rid, r] of rooms.entries()) {
+    if (r === targetRoom) return rid;
+  }
+  return null;
+}
+
+function pickProducersForBroadcast(room) {
+  let videoProducer = null;
+  let audioProducer = null;
+  for (const peer of room.peers.values()) {
+    for (const producer of peer.producers) {
+      if (producer.closed) continue;
+      if (!videoProducer && producer.kind === 'video') videoProducer = producer;
+      if (!audioProducer && producer.kind === 'audio') audioProducer = producer;
+    }
+    if (videoProducer && audioProducer) break;
+  }
+  return { videoProducer, audioProducer };
+}
+
+function buildSdpForConsumers({ videoConsumer, videoPort, audioConsumer, audioPort }) {
+  const lines = [
+    'v=0',
+    'o=- 0 0 IN IP4 127.0.0.1',
+    's=mediasoup-live',
+    'c=IN IP4 127.0.0.1',
+    't=0 0',
+  ];
+
+  function appendMedia(kind, consumer, port) {
+    const codec = consumer.rtpParameters.codecs[0];
+    const pt = codec.payloadType;
+    const mime = codec.mimeType.split('/')[1]; // VP8, H264, opus, ...
+    const clockRate = codec.clockRate;
+    const channels = codec.channels && codec.channels > 1 ? `/${codec.channels}` : '';
+    lines.push(`m=${kind} ${port} RTP/AVP ${pt}`);
+    lines.push('a=rtcp-mux');
+    lines.push(`a=rtpmap:${pt} ${mime}/${clockRate}${channels}`);
+    const params = codec.parameters || {};
+    const fmtpParts = Object.entries(params)
+      .filter(([, v]) => v !== undefined && v !== null && v !== '')
+      .map(([k, v]) => `${k}=${v}`);
+    if (fmtpParts.length > 0) {
+      lines.push(`a=fmtp:${pt} ${fmtpParts.join(';')}`);
+    }
+    lines.push('a=sendonly');
+  }
+
+  appendMedia('video', videoConsumer, videoPort);
+  if (audioConsumer) {
+    appendMedia('audio', audioConsumer, audioPort);
+  }
+  return lines.join('\n') + '\n';
+}
+
+async function startLiveHlsForRoom(roomId) {
+  if (liveHlsPipelines.has(roomId)) return liveHlsPipelines.get(roomId);
+
+  const room = rooms.get(roomId);
+  if (!room) throw new Error(`live_hls_room_not_found:${roomId}`);
+
+  const { videoProducer, audioProducer } = pickProducersForBroadcast(room);
+  if (!videoProducer) {
+    // Not enough producers yet; will be retried on next produce.
+    return null;
+  }
+
+  // Reserve slot early to avoid races.
+  const placeholder = { starting: true };
+  liveHlsPipelines.set(roomId, placeholder);
+
+  let videoTransport = null;
+  let audioTransport = null;
+  let videoConsumer = null;
+  let audioConsumer = null;
+  let videoPort = null;
+  let audioPort = null;
+  let ffmpeg = null;
+  const hlsDir = path.join(LIVE_HLS_DIR, sanitizeRoomIdForPath(roomId));
+
+  try {
+    await fs.promises.mkdir(hlsDir, { recursive: true });
+    // Clean any stale files
+    try {
+      const stale = await fs.promises.readdir(hlsDir);
+      await Promise.all(stale.map((f) =>
+        fs.promises.unlink(path.join(hlsDir, f)).catch(() => {})
+      ));
+    } catch (_) {}
+
+    const router = room.router;
+    const plainOpts = {
+      listenIp: { ip: '127.0.0.1', announcedIp: null },
+      rtcpMux: true,
+      comedia: false,
+      enableSrtp: false,
+    };
+
+    videoTransport = await router.createPlainTransport(plainOpts);
+    videoPort = allocLiveRtpPort();
+    await videoTransport.connect({ ip: '127.0.0.1', port: videoPort });
+    videoConsumer = await videoTransport.consume({
+      producerId: videoProducer.id,
+      rtpCapabilities: router.rtpCapabilities,
+      paused: true,
+    });
+
+    if (audioProducer) {
+      audioTransport = await router.createPlainTransport(plainOpts);
+      audioPort = allocLiveRtpPort();
+      await audioTransport.connect({ ip: '127.0.0.1', port: audioPort });
+      audioConsumer = await audioTransport.consume({
+        producerId: audioProducer.id,
+        rtpCapabilities: router.rtpCapabilities,
+        paused: true,
+      });
+    }
+
+    const sdp = buildSdpForConsumers({ videoConsumer, videoPort, audioConsumer, audioPort });
+    const sdpPath = path.join(hlsDir, 'input.sdp');
+    await fs.promises.writeFile(sdpPath, sdp, 'utf8');
+
+    const ffmpegArgs = [
+      '-loglevel', 'warning',
+      '-protocol_whitelist', 'file,udp,rtp',
+      '-fflags', '+genpts+nobuffer',
+      '-flags', 'low_delay',
+      '-probesize', '32',
+      '-analyzeduration', '0',
+      '-i', sdpPath,
+      '-map', '0:v:0',
+      ...(audioConsumer ? ['-map', '0:a:0'] : []),
+      '-c:v', 'libx264',
+      '-preset', 'ultrafast',
+      '-tune', 'zerolatency',
+      '-profile:v', 'baseline',
+      '-level', '3.1',
+      '-pix_fmt', 'yuv420p',
+      '-g', '60',
+      '-keyint_min', '60',
+      '-sc_threshold', '0',
+      '-b:v', '1500k',
+      '-maxrate', '1800k',
+      '-bufsize', '3000k',
+      ...(audioConsumer
+        ? ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2']
+        : []),
+      '-f', 'hls',
+      '-hls_time', '2',
+      '-hls_list_size', '6',
+      '-hls_flags', 'delete_segments+independent_segments+omit_endlist+program_date_time',
+      '-hls_segment_type', 'mpegts',
+      '-hls_segment_filename', path.join(hlsDir, 'seg_%05d.ts'),
+      path.join(hlsDir, 'index.m3u8'),
+    ];
+
+    console.log(`[live-hls ${roomId}] spawning ffmpeg (videoPort=${videoPort}, audioPort=${audioPort ?? 'none'})`);
+    ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    ffmpeg.stderr.on('data', (chunk) => {
+      const text = chunk.toString();
+      if (text.trim().length > 0) console.log(`[live-hls ${roomId}] ${text.trim()}`);
+    });
+    ffmpeg.on('error', (err) => {
+      console.error(`[live-hls ${roomId}] ffmpeg error:`, err.message);
+    });
+    ffmpeg.on('close', (code) => {
+      console.log(`[live-hls ${roomId}] ffmpeg exited code=${code}`);
+      stopLiveHlsForRoom(roomId).catch(() => {});
+    });
+
+    const pipeline = {
+      roomId,
+      hlsDir,
+      ffmpeg,
+      videoTransport,
+      audioTransport,
+      videoConsumer,
+      audioConsumer,
+      videoPort,
+      audioPort,
+      videoProducerId: videoProducer.id,
+      audioProducerId: audioProducer ? audioProducer.id : null,
+      startedAt: Date.now(),
+      stopping: false,
+    };
+    liveHlsPipelines.set(roomId, pipeline);
+
+    // Auto-stop pipeline when source producer closes.
+    const onVideoClosed = () => {
+      console.log(`[live-hls ${roomId}] video producer closed`);
+      stopLiveHlsForRoom(roomId).catch(() => {});
+    };
+    videoConsumer.on('producerclose', onVideoClosed);
+    if (audioConsumer) {
+      audioConsumer.on('producerclose', () => {
+        console.log(`[live-hls ${roomId}] audio producer closed (continuing video-only)`);
+      });
+    }
+
+    // Resume consumers so RTP starts flowing.
+    await videoConsumer.resume();
+    if (audioConsumer) await audioConsumer.resume();
+
+    // Mark broadcast session as live.
+    const session = liveBroadcastSessions.get(roomId);
+    if (session) {
+      session.status = 'live';
+      session.streamStartedAt = new Date().toISOString();
+    }
+
+    console.log(`[live-hls ${roomId}] pipeline started -> ${hlsDir}`);
+    return pipeline;
+  } catch (err) {
+    console.error(`[live-hls ${roomId}] start failed:`, err);
+    // Cleanup on failure.
+    try { if (ffmpeg) ffmpeg.kill('SIGKILL'); } catch (_) {}
+    try { if (videoConsumer) videoConsumer.close(); } catch (_) {}
+    try { if (audioConsumer) audioConsumer.close(); } catch (_) {}
+    try { if (videoTransport) videoTransport.close(); } catch (_) {}
+    try { if (audioTransport) audioTransport.close(); } catch (_) {}
+    freeLiveRtpPort(videoPort);
+    freeLiveRtpPort(audioPort);
+    if (liveHlsPipelines.get(roomId) === placeholder) {
+      liveHlsPipelines.delete(roomId);
+    } else {
+      liveHlsPipelines.delete(roomId);
+    }
+    throw err;
+  }
+}
+
+async function stopLiveHlsForRoom(roomId) {
+  const p = liveHlsPipelines.get(roomId);
+  if (!p || p.starting === true) return;
+  if (p.stopping) return;
+  p.stopping = true;
+
+  try { if (p.ffmpeg && !p.ffmpeg.killed) p.ffmpeg.kill('SIGINT'); } catch (_) {}
+  setTimeout(() => {
+    try { if (p.ffmpeg && !p.ffmpeg.killed) p.ffmpeg.kill('SIGKILL'); } catch (_) {}
+  }, 3000);
+
+  try { if (p.videoConsumer && !p.videoConsumer.closed) p.videoConsumer.close(); } catch (_) {}
+  try { if (p.audioConsumer && !p.audioConsumer.closed) p.audioConsumer.close(); } catch (_) {}
+  try { if (p.videoTransport && !p.videoTransport.closed) p.videoTransport.close(); } catch (_) {}
+  try { if (p.audioTransport && !p.audioTransport.closed) p.audioTransport.close(); } catch (_) {}
+  freeLiveRtpPort(p.videoPort);
+  freeLiveRtpPort(p.audioPort);
+
+  liveHlsPipelines.delete(roomId);
+
+  const session = liveBroadcastSessions.get(roomId);
+  if (session) {
+    session.status = 'ended';
+    session.streamEndedAt = new Date().toISOString();
+  }
+
+  // Schedule HLS directory cleanup after a grace period so late viewers see EXT-X-ENDLIST behaviour.
+  if (p.hlsDir) {
+    setTimeout(() => {
+      fs.rm(p.hlsDir, { recursive: true, force: true }, () => {});
+    }, 60 * 1000);
+  }
+  console.log(`[live-hls ${roomId}] pipeline stopped`);
+}
+
+function maybeStartLiveHlsForSocketRoom(socket) {
+  // Find roomId where socket is a peer.
+  for (const [rid, r] of rooms.entries()) {
+    if (r.peers.has(socket.id)) {
+      if (liveBroadcastSessions.has(rid) && !liveHlsPipelines.has(rid)) {
+        startLiveHlsForRoom(rid).catch((e) =>
+          console.error(`[live-hls ${rid}] auto-start failed:`, e.message)
+        );
+      }
+      return rid;
+    }
+  }
+  return null;
+}
+
+// Serve HLS segments
+app.use(
+  '/live',
+  express.static(LIVE_HLS_DIR, {
+    fallthrough: false,
+    setHeaders: (res, filePath) => {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      if (filePath.endsWith('.m3u8')) {
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+      } else if (filePath.endsWith('.ts')) {
+        res.setHeader('Cache-Control', 'public, max-age=10');
+        res.setHeader('Content-Type', 'video/mp2t');
+      }
+    },
+  })
+);
+
 app.post('/live-broadcast/session', async (req, res) => {
   const { roomId, title, channelId, startTime, scheduledEndTime } = req.body || {};
   const normalizedRoomId = String(roomId || '').trim() || `broadcast-${Date.now()}`;
@@ -1410,7 +1753,27 @@ app.post('/live-broadcast/session', async (req, res) => {
   };
 
   liveBroadcastSessions.set(normalizedRoomId, session);
+
+  // If broadcaster already joined the mediasoup room before calling session, start now.
+  if (rooms.has(normalizedRoomId)) {
+    startLiveHlsForRoom(normalizedRoomId).catch((e) =>
+      console.error(`[live-hls ${normalizedRoomId}] start on session failed:`, e.message)
+    );
+  }
+
   return res.status(201).json(session);
+});
+
+app.post('/live-broadcast/stop/:roomId', async (req, res) => {
+  const roomId = String(req.params.roomId || '').trim();
+  if (!roomId) return res.status(400).json({ error: 'roomId_required' });
+  await stopLiveHlsForRoom(roomId);
+  const session = liveBroadcastSessions.get(roomId);
+  if (session) {
+    session.status = 'ended';
+    session.streamEndedAt = new Date().toISOString();
+  }
+  return res.json({ ok: true, roomId });
 });
 
 app.get('/live-broadcast/session/:roomId', (req, res) => {
