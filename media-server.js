@@ -549,6 +549,10 @@ conferenceNsp.on('connection', (socket) => {
         producer.on('transportclose', () => producer.close());
 
         // Auto-start live HLS pipeline if this room has a registered broadcast session.
+        console.log(
+          `[produce] kind=${kind} socket=${socket.id} producerId=${producer.id} ` +
+            `(checking live-hls auto-start)`
+        );
         try { maybeStartLiveHlsForSocketRoom(socket); } catch (_) {}
 
         // Notify others
@@ -712,6 +716,10 @@ conferenceNsp.on('connection', (socket) => {
         producer.on('transportclose', () => producer.close());
 
         // Auto-start live HLS pipeline if this room has a registered broadcast session.
+        console.log(
+          `[produce/legacy] kind=${kind} socket=${socket.id} producerId=${producer.id} ` +
+            `(checking live-hls auto-start)`
+        );
         try { maybeStartLiveHlsForSocketRoom(socket); } catch (_) {}
 
         // Notify others
@@ -1546,8 +1554,16 @@ async function startLiveHlsForRoom(roomId) {
   const { videoProducer, audioProducer } = pickProducersForBroadcast(room);
   if (!videoProducer) {
     // Not enough producers yet; will be retried on next produce.
+    console.log(
+      `[live-hls ${roomId}] startLiveHlsForRoom: no video producer yet ` +
+        `(peers=${room.peers.size}). Will retry on next produce.`
+    );
     return null;
   }
+  console.log(
+    `[live-hls ${roomId}] startLiveHlsForRoom: producers ready ` +
+      `(video=${!!videoProducer}, audio=${!!audioProducer}). Starting pipeline...`
+  );
 
   // Reserve slot early to avoid races.
   const placeholder = { starting: true };
@@ -1853,6 +1869,44 @@ app.post('/live-broadcast/session', async (req, res) => {
     startLiveHlsForRoom(normalizedRoomId).catch((e) =>
       console.error(`[live-hls ${normalizedRoomId}] start on session failed:`, e.message)
     );
+  }
+
+  // Defansif: client/backend POST'u yayıncının mediasoup produce'undan ÖNCE
+  // gelirse, `startLiveHlsForRoom` no-op döner ve sadece bir sonraki `produce`
+  // olayı pipeline'i tetikleyebilir. O olay da kaçırılırsa izleyici sonsuza
+  // kadar 404 alır. 30sn'lik bir watcher koy: her saniye odanın hazır olup
+  // olmadığını kontrol et, hazırsa pipeline'i başlat.
+  if (!liveHlsPipelines.has(normalizedRoomId)) {
+    let attempts = 0;
+    const maxAttempts = 30;
+    const watcher = setInterval(() => {
+      attempts += 1;
+      // Pipeline başladıysa veya session kaldırıldıysa dur.
+      if (
+        liveHlsPipelines.has(normalizedRoomId) ||
+        !liveBroadcastSessions.has(normalizedRoomId)
+      ) {
+        clearInterval(watcher);
+        return;
+      }
+      if (attempts >= maxAttempts) {
+        console.warn(
+          `[live-hls ${normalizedRoomId}] watcher giving up after ${attempts}s; ` +
+            `broadcaster never produced media (peers=` +
+            `${rooms.get(normalizedRoomId)?.peers.size ?? 0}).`
+        );
+        clearInterval(watcher);
+        return;
+      }
+      if (rooms.has(normalizedRoomId)) {
+        startLiveHlsForRoom(normalizedRoomId).catch((e) =>
+          console.error(
+            `[live-hls ${normalizedRoomId}] watcher start failed:`,
+            e.message
+          )
+        );
+      }
+    }, 1000);
   }
 
   return res.status(201).json(session);
