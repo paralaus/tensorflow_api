@@ -200,14 +200,33 @@ function buildSdpForConsumers({ videoConsumer, videoPort, audioConsumer, audioPo
     return lines.join('\n') + '\n';
 }
 
+// Resolve a mediasoup room by id, looking in Server.js's own `roomList` first
+// and falling back to the ConferenceSocket module's `rooms` map. Both expose
+// `{ router, peers: Map<socketId, { producers }> }` and are compatible with
+// `pickProducersForBroadcast`.
+function resolveMediasoupRoom(roomId) {
+    if (roomList && roomList.has && roomList.has(roomId)) return roomList.get(roomId);
+    const confRooms = conferenceSocketMod && conferenceSocketMod.rooms;
+    if (confRooms && confRooms.has(roomId)) return confRooms.get(roomId);
+    return null;
+}
+
+function hasMediasoupRoom(roomId) {
+    return resolveMediasoupRoom(roomId) !== null;
+}
+
 async function startLiveHlsForRoom(roomId) {
     if (liveHlsPipelines.has(roomId)) return liveHlsPipelines.get(roomId);
 
-    const room = roomList.get(roomId);
+    const room = resolveMediasoupRoom(roomId);
     if (!room) throw new Error(`live_hls_room_not_found:${roomId}`);
 
     const { videoProducer, audioProducer } = pickProducersForBroadcast(room);
-    if (!videoProducer) return null;
+    if (!videoProducer) {
+        log.info(`[live-hls ${roomId}] no video producer yet (peers=${room.peers ? room.peers.size : 0}); will retry on next produce`);
+        return null;
+    }
+    log.info(`[live-hls ${roomId}] producers ready (video=${!!videoProducer}, audio=${!!audioProducer}); starting pipeline`);
 
     const placeholder = { starting: true };
     liveHlsPipelines.set(roomId, placeholder);
@@ -425,9 +444,13 @@ async function stopLiveHlsForRoom(roomId) {
 
 function maybeStartLiveHlsForRoom(roomId) {
     if (!roomId) return;
-    if (!roomList.has(roomId)) return;
-    if (!liveBroadcastSessions.has(roomId)) return;
+    if (!hasMediasoupRoom(roomId)) return;
+    if (!liveBroadcastSessions.has(roomId)) {
+        log.info(`[live-hls ${roomId}] skip auto-start: no session registered yet (sessions=${liveBroadcastSessions.size})`);
+        return;
+    }
     if (liveHlsPipelines.has(roomId)) return;
+    log.info(`[live-hls ${roomId}] auto-start triggered`);
     startLiveHlsForRoom(roomId).catch((e) =>
         log.error(`[live-hls ${roomId}] auto-start failed:`, e.message),
     );
@@ -630,7 +653,19 @@ const io = require('socket.io')(httpsServer, {
 });
 
 // Initialize Conference Namespace (for Admin and Mobile App compatibility)
-require('./ConferenceSocket')(io).catch(err => console.error('Failed to init conference socket:', err));
+// We capture the module handle (not just the init function) so we can read
+// its `rooms` map and register a producer-added hook. The broadcaster flow
+// goes through ConferenceSocket, while live HLS pipeline state lives here
+// in Server.js — the hook bridges the two.
+const conferenceSocketMod = require('./ConferenceSocket');
+conferenceSocketMod(io).catch(err => console.error('Failed to init conference socket:', err));
+conferenceSocketMod.setOnProducerAddedHook((roomId) => {
+    try {
+        maybeStartLiveHlsForRoom(roomId);
+    } catch (e) {
+        log.error('[live-hls] hook maybeStartLiveHlsForRoom failed:', e && e.message);
+    }
+});
 
 
 const host = 'https://' + 'localhost' + ':' + config.server.listen.port; // config.server.listen.ip
@@ -1466,11 +1501,48 @@ function startServer() {
 
         liveBroadcastSessions.set(normalizedRoomId, session);
 
+        const roomReady = hasMediasoupRoom(normalizedRoomId);
+        log.info(
+            `[live-broadcast/session] register roomId=${normalizedRoomId} ` +
+                `roomReady=${roomReady} channelId=${channelId || '-'}`,
+        );
+
         // If broadcaster already joined the mediasoup room before calling session, start now.
-        if (roomList.has(normalizedRoomId)) {
+        if (roomReady) {
             startLiveHlsForRoom(normalizedRoomId).catch((e) =>
                 log.error(`[live-hls ${normalizedRoomId}] start on session failed:`, e.message),
             );
+        }
+
+        // Defansif: client/backend POST'u yayıncının produce'undan ÖNCE gelirse
+        // ya da producer hook kaçırılırsa, 30sn boyunca her saniye yeniden dene.
+        if (!liveHlsPipelines.has(normalizedRoomId)) {
+            let attempts = 0;
+            const maxAttempts = 30;
+            const watcher = setInterval(() => {
+                attempts += 1;
+                if (
+                    liveHlsPipelines.has(normalizedRoomId) ||
+                    !liveBroadcastSessions.has(normalizedRoomId)
+                ) {
+                    clearInterval(watcher);
+                    return;
+                }
+                if (attempts >= maxAttempts) {
+                    const room = resolveMediasoupRoom(normalizedRoomId);
+                    log.warn(
+                        `[live-hls ${normalizedRoomId}] watcher giving up after ${attempts}s ` +
+                            `(roomReady=${!!room}, peers=${room && room.peers ? room.peers.size : 0})`,
+                    );
+                    clearInterval(watcher);
+                    return;
+                }
+                if (hasMediasoupRoom(normalizedRoomId)) {
+                    startLiveHlsForRoom(normalizedRoomId).catch((e) =>
+                        log.error(`[live-hls ${normalizedRoomId}] watcher start failed:`, e.message),
+                    );
+                }
+            }, 1000);
         }
 
         return res.status(201).json(session);
@@ -1494,6 +1566,52 @@ function startServer() {
             return res.status(404).json({ error: 'live_broadcast_session_not_found' });
         }
         return res.json(liveBroadcastSessions.get(roomId));
+    });
+
+    // Debug: anlık canlı yayın durumu. İzleyici "hazırlanıyor"da kalıyorsa:
+    //   - sessions boş → POST /live-broadcast/session media-server'a hiç ulaşmamış
+    //   - session var, hasRoom=false → yayıncı henüz mediasoup'a bağlanmamış
+    //   - hasRoom=true, hasPipeline=false → produce hook'u tetiklenmemiş
+    //     ya da pickProducersForBroadcast video bulamamış
+    app.get('/live-broadcast/debug', (req, res) => {
+        const confRooms = (conferenceSocketMod && conferenceSocketMod.rooms) || new Map();
+        const sessions = Array.from(liveBroadcastSessions.entries()).map(([rid, s]) => {
+            const room = resolveMediasoupRoom(rid);
+            return {
+                roomId: rid,
+                sessionId: s.sessionId,
+                status: s.status,
+                channelId: s.channelId,
+                startTime: s.startTime,
+                streamStartedAt: s.streamStartedAt || null,
+                streamEndedAt: s.streamEndedAt || null,
+                hasRoom: !!room,
+                roomSource: roomList.has(rid) ? 'roomList' : confRooms.has(rid) ? 'conferenceSocket' : null,
+                peerCount: room && room.peers ? room.peers.size : 0,
+                hasPipeline: liveHlsPipelines.has(rid),
+            };
+        });
+        const orphanRooms = [];
+        for (const [rid, r] of confRooms.entries()) {
+            if (!liveBroadcastSessions.has(rid)) {
+                orphanRooms.push({ roomId: rid, source: 'conferenceSocket', peerCount: r.peers ? r.peers.size : 0 });
+            }
+        }
+        for (const [rid, r] of roomList.entries()) {
+            if (!liveBroadcastSessions.has(rid)) {
+                orphanRooms.push({ roomId: rid, source: 'roomList', peerCount: r.peers ? r.peers.size : 0 });
+            }
+        }
+        return res.json({
+            now: new Date().toISOString(),
+            sessionCount: liveBroadcastSessions.size,
+            confRoomCount: confRooms.size,
+            mainRoomCount: roomList.size,
+            pipelineCount: liveHlsPipelines.size,
+            sessions,
+            pipelines: Array.from(liveHlsPipelines.keys()),
+            orphanRooms,
+        });
     });
 
     // daha önce hiçbir sayfayla eşleşmediğinden 404 bulunamadı

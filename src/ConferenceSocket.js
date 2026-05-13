@@ -98,6 +98,12 @@ let workers = [];
 let nextWorkerIndex = 0;
 const rooms = new Map(); // roomId -> { router, peers: Map<socketId, { transports, producers, consumers }> }
 
+// Hook called whenever a producer is added to any room here. Server.js sets
+// this so the live HLS auto-start (which lives in Server.js with access to
+// liveBroadcastSessions / liveHlsPipelines) can react to producers created
+// through the ConferenceSocket flow too. Receives the roomId string.
+let onProducerAddedHook = null;
+
 // Main REST backend (used to load persistent bans and persist kick/ban actions).
 const BACKEND_BASE_URL =
   process.env.CONFERENCE_BACKEND_URL ||
@@ -662,6 +668,14 @@ module.exports = async function init(io) {
             });
 
             console.log(`[ConferenceSocket] Producer created: ${producer.id} (${kind}) for user ${socket.userName}`);
+
+            // Notify Server.js so it can auto-start the live HLS pipeline if
+            // a live broadcast session has been registered for this room.
+            if (typeof onProducerAddedHook === 'function') {
+                try { onProducerAddedHook(roomId); } catch (hookErr) {
+                    console.error('[ConferenceSocket] onProducerAddedHook failed:', hookErr.message);
+                }
+            }
 
             // Announce to others
             const announcementData = {
@@ -1413,4 +1427,15 @@ module.exports = async function init(io) {
   if (workers.length === 0) {
     await runMediasoupWorkers();
   }
+};
+
+// Expose internals so Server.js can integrate with the live HLS pipeline:
+//   - `rooms`: the mediasoup room map used by this socket flow (different
+//     from Server.js's own `roomList`). Live HLS code needs router + producers
+//     from whichever map the broadcaster actually joined.
+//   - `setOnProducerAddedHook(fn)`: register a callback fired with `roomId`
+//     every time a producer is created, so HLS can be (re-)attempted.
+module.exports.rooms = rooms;
+module.exports.setOnProducerAddedHook = (fn) => {
+    onProducerAddedHook = typeof fn === 'function' ? fn : null;
 };
