@@ -177,6 +177,46 @@ const typingUsersByRoom = new Map(); // roomId -> Set<userId>
 const roomHostByRoom = new Map(); // roomId -> host userId (first joiner fallback)
 const liveBroadcastSessions = new Map(); // roomId -> { sessionId, roomId, hlsUrl, playbackUrl, ... }
 
+// Grace period before tearing down an empty room. Lets a broadcaster (or any
+// viewer in a regular call) reconnect after a short network blip without
+// losing the mediasoup router, transports, FFmpeg pipeline and HLS playlist.
+const ROOM_TEARDOWN_GRACE_MS = 60 * 1000;
+const roomTeardownTimers = new Map(); // roomId -> Timeout
+
+function cancelRoomTeardown(roomId, reason) {
+  const t = roomTeardownTimers.get(roomId);
+  if (t) {
+    clearTimeout(t);
+    roomTeardownTimers.delete(roomId);
+    console.log(`[room ${roomId}] teardown cancelled (${reason || 'rejoin'})`);
+  }
+}
+
+function scheduleRoomTeardown(roomId) {
+  // If a timer is already pending, keep it (don't extend the window every
+  // time a stray socket disconnect fires).
+  if (roomTeardownTimers.has(roomId)) return;
+  console.log(`[room ${roomId}] scheduling teardown in ${ROOM_TEARDOWN_GRACE_MS}ms`);
+  const timer = setTimeout(() => {
+    roomTeardownTimers.delete(roomId);
+    const room = rooms.get(roomId);
+    // Only tear down if the room is still empty when the timer fires.
+    if (!room) return;
+    if (room.peers.size > 0) {
+      console.log(`[room ${roomId}] teardown skipped (peers rejoined)`);
+      return;
+    }
+    if (liveHlsPipelines.has(roomId)) {
+      stopLiveHlsForRoom(roomId).catch(() => {});
+    }
+    try { room.router.close(); } catch (_) {}
+    rooms.delete(roomId);
+    roomHostByRoom.delete(roomId);
+    console.log(`Room ${roomId} closed (after grace period)`);
+  }, ROOM_TEARDOWN_GRACE_MS);
+  roomTeardownTimers.set(roomId, timer);
+}
+
 // Initialize Mediasoup Workers
 async function runMediasoupWorkers() {
   //const numWorkers = Math.min(os.cpus().length, 4);
@@ -278,7 +318,11 @@ conferenceNsp.on('connection', (socket) => {
 
     socket.join(roomId);
     socketRoomMap.set(socket.id, roomId);
-    
+
+    // Someone is rejoining — cancel any pending teardown so the existing
+    // router + HLS pipeline stay alive.
+    cancelRoomTeardown(roomId, 'join-room');
+
     // Create/Get Router
     let router;
     if (rooms.has(roomId)) {
@@ -370,14 +414,10 @@ conferenceNsp.on('connection', (socket) => {
         }
         
         if (room.peers.size === 0) {
-          // Stop live HLS pipeline if any
-          if (liveHlsPipelines.has(roomId)) {
-            stopLiveHlsForRoom(roomId).catch(() => {});
-          }
-          room.router.close();
-          rooms.delete(roomId);
-          roomHostByRoom.delete(roomId);
-          console.log(`Room ${roomId} closed`);
+          // Defer teardown: keep router + HLS pipeline alive for a grace
+          // window so the broadcaster (or anyone) can reconnect after a
+          // short network drop without losing the stream.
+          scheduleRoomTeardown(roomId);
         }
       }
     });
@@ -1412,6 +1452,16 @@ const LIVE_RTP_PORT_BASE = parseIntegerEnv(process.env.LIVE_RTP_PORT_BASE, 30000
 const LIVE_RTP_PORT_MAX = parseIntegerEnv(process.env.LIVE_RTP_PORT_MAX, 30400);
 const liveRtpPortInUse = new Set();
 const liveHlsPipelines = new Map(); // roomId -> { ffmpeg, transports, consumers, ports, hlsDir, starting, stopping }
+const liveHlsCleanupTimers = new Map(); // roomId -> Timeout (pending hlsDir rm)
+
+function cancelLiveHlsCleanup(roomId, reason) {
+  const t = liveHlsCleanupTimers.get(roomId);
+  if (t) {
+    clearTimeout(t);
+    liveHlsCleanupTimers.delete(roomId);
+    console.log(`[live-hls ${roomId}] cleanup timer cancelled (${reason || 'restart'})`);
+  }
+}
 
 function allocLiveRtpPort() {
   // Allocate pair (RTP + RTCP non-mux not used; we use rtcp-mux so single port).
@@ -1512,14 +1562,38 @@ async function startLiveHlsForRoom(roomId) {
   let ffmpeg = null;
   const hlsDir = path.join(LIVE_HLS_DIR, sanitizeRoomIdForPath(roomId));
 
+  // If we are restarting within the grace window, the cleanup timer from a
+  // previous stopLiveHlsForRoom may still be pending. Cancel it before we
+  // begin writing new segments.
+  cancelLiveHlsCleanup(roomId, 'pipeline-start');
+
   try {
     await fs.promises.mkdir(hlsDir, { recursive: true });
-    // Clean any stale files
+    // Determine where to resume segment numbering: if old segments exist in
+    // the directory (broadcaster reconnecting after a blip), continue the
+    // index so viewers' playlists stay continuous. Otherwise start fresh.
+    let startNumber = 0;
+    let resumeFromExisting = false;
     try {
-      const stale = await fs.promises.readdir(hlsDir);
-      await Promise.all(stale.map((f) =>
-        fs.promises.unlink(path.join(hlsDir, f)).catch(() => {})
-      ));
+      const existing = await fs.promises.readdir(hlsDir);
+      let maxSeg = -1;
+      for (const f of existing) {
+        const m = f.match(/^seg_(\d+)\.ts$/);
+        if (m) {
+          const n = parseInt(m[1], 10);
+          if (Number.isFinite(n) && n > maxSeg) maxSeg = n;
+        }
+      }
+      if (maxSeg >= 0) {
+        startNumber = maxSeg + 1;
+        resumeFromExisting = true;
+        console.log(`[live-hls ${roomId}] resuming segment numbering at ${startNumber}`);
+      } else {
+        // No previous segments — clean any stale junk (e.g. old sdp).
+        await Promise.all(existing.map((f) =>
+          fs.promises.unlink(path.join(hlsDir, f)).catch(() => {})
+        ));
+      }
     } catch (_) {}
 
     const router = room.router;
@@ -1582,8 +1656,11 @@ async function startLiveHlsForRoom(roomId) {
       '-f', 'hls',
       '-hls_time', '2',
       '-hls_list_size', '6',
-      '-hls_flags', 'delete_segments+independent_segments+omit_endlist+program_date_time',
+      '-hls_flags', resumeFromExisting
+        ? 'delete_segments+independent_segments+omit_endlist+program_date_time+append_list'
+        : 'delete_segments+independent_segments+omit_endlist+program_date_time',
       '-hls_segment_type', 'mpegts',
+      '-start_number', String(startNumber),
       '-hls_segment_filename', path.join(hlsDir, 'seg_%05d.ts'),
       path.join(hlsDir, 'index.m3u8'),
     ];
@@ -1692,9 +1769,11 @@ async function stopLiveHlsForRoom(roomId) {
 
   // Schedule HLS directory cleanup after a grace period so late viewers see EXT-X-ENDLIST behaviour.
   if (p.hlsDir) {
-    setTimeout(() => {
+    const cleanupTimer = setTimeout(() => {
+      liveHlsCleanupTimers.delete(roomId);
       fs.rm(p.hlsDir, { recursive: true, force: true }, () => {});
     }, 60 * 1000);
+    liveHlsCleanupTimers.set(roomId, cleanupTimer);
   }
   console.log(`[live-hls ${roomId}] pipeline stopped`);
 }
