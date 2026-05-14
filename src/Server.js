@@ -45,6 +45,7 @@ const axios = require('axios');
 const ngrok = require('ngrok');
 const jwt = require('jsonwebtoken');
 const fs = require('fs');
+const dgram = require('dgram');
 const config = require('./config');
 const checkXSS = require('./XSS.js');
 const Host = require('./Host');
@@ -108,12 +109,17 @@ const LIVE_HLS_BASE_URL =
     String(process.env.MEDIA_PUBLIC_BASE_URL || '').trim() ||
     `http://localhost:${LIVE_HLS_PORT}/live`;
 
-const LIVE_RTP_PORT_BASE = _parseIntEnv(process.env.LIVE_RTP_PORT_BASE, 30000);
-const LIVE_RTP_PORT_MAX = _parseIntEnv(process.env.LIVE_RTP_PORT_MAX, 30400);
+// IMPORTANT: keep this range OUTSIDE mediasoup worker's rtcMinPort/rtcMaxPort
+// (default 10000-59999). PlainTransport's listenIp picks a random local port
+// from that worker range, so any overlap causes ffmpeg's UDP bind to fail
+// with 'Address already in use'. 60000-60400 is well outside the default.
+const LIVE_RTP_PORT_BASE = _parseIntEnv(process.env.LIVE_RTP_PORT_BASE, 60000);
+const LIVE_RTP_PORT_MAX = _parseIntEnv(process.env.LIVE_RTP_PORT_MAX, 60400);
 const liveRtpPortInUse = new Set();
 const liveHlsPipelines = new Map(); // roomId -> pipeline
 const liveHlsCleanupTimers = new Map(); // roomId -> Timeout
 const liveBroadcastSessions = new Map(); // roomId -> session metadata
+const liveHlsRestartState = new Map(); // roomId -> { lastFailAt, failCount, nextAllowedAt }
 
 function cancelLiveHlsCleanup(roomId, reason) {
     const t = liveHlsCleanupTimers.get(roomId);
@@ -136,6 +142,71 @@ function allocLiveRtpPort() {
 
 function freeLiveRtpPort(p) {
     if (typeof p === 'number') liveRtpPortInUse.delete(p);
+}
+
+// Test whether a UDP port can be bound on 127.0.0.1 right now. Used to skip
+// ports already held by other processes on the host so ffmpeg doesn't crash
+// with 'Address already in use'.
+function probeUdpPortFree(port) {
+    return new Promise((resolve) => {
+        const sock = dgram.createSocket('udp4');
+        let done = false;
+        const finish = (ok) => {
+            if (done) return;
+            done = true;
+            try { sock.close(); } catch (_) {}
+            resolve(ok);
+        };
+        sock.once('error', () => finish(false));
+        try {
+            sock.bind({ port, address: '127.0.0.1', exclusive: true }, () => finish(true));
+        } catch (_) {
+            finish(false);
+        }
+    });
+}
+
+// Reserve a UDP port that is both free in our in-memory tracker AND actually
+// bindable on the host. Returns the port number, or throws if exhausted.
+//
+// Strategy: first ask the kernel for an ephemeral port (bind to :0). The OS
+// guarantees this port is free right now and uses a wide range (Linux default
+// 32768-60999), which avoids the case where a fixed port like 60000 is being
+// held by another process on the host. We close the probe socket immediately
+// so ffmpeg can take the port; a tiny race window remains but is far smaller
+// than scanning a fixed slot.
+async function reserveBindableUdpPort() {
+    // First try OS-assigned ephemeral ports (a few attempts).
+    for (let attempt = 0; attempt < 8; attempt++) {
+        // eslint-disable-next-line no-await-in-loop
+        const port = await new Promise((resolve) => {
+            const sock = dgram.createSocket('udp4');
+            sock.once('error', () => resolve(null));
+            try {
+                sock.bind({ port: 0, address: '127.0.0.1', exclusive: true }, () => {
+                    const p = sock.address() && sock.address().port;
+                    sock.close(() => resolve(p || null));
+                });
+            } catch (_) {
+                resolve(null);
+            }
+        });
+        if (port && !liveRtpPortInUse.has(port)) {
+            liveRtpPortInUse.add(port);
+            return port;
+        }
+    }
+    // Fallback: scan the configured fixed range and probe each port.
+    for (let p = LIVE_RTP_PORT_BASE; p <= LIVE_RTP_PORT_MAX; p++) {
+        if (liveRtpPortInUse.has(p)) continue;
+        // eslint-disable-next-line no-await-in-loop
+        const ok = await probeUdpPortFree(p);
+        if (ok) {
+            liveRtpPortInUse.add(p);
+            return p;
+        }
+    }
+    throw new Error('no_bindable_live_rtp_port');
 }
 
 function sanitizeRoomIdForPath(roomId) {
@@ -279,7 +350,7 @@ async function startLiveHlsForRoom(roomId) {
         };
 
         videoTransport = await router.createPlainTransport(plainOpts);
-        videoPort = allocLiveRtpPort();
+        videoPort = await reserveBindableUdpPort();
         await videoTransport.connect({ ip: '127.0.0.1', port: videoPort });
         videoConsumer = await videoTransport.consume({
             producerId: videoProducer.id,
@@ -289,7 +360,7 @@ async function startLiveHlsForRoom(roomId) {
 
         if (audioProducer) {
             audioTransport = await router.createPlainTransport(plainOpts);
-            audioPort = allocLiveRtpPort();
+            audioPort = await reserveBindableUdpPort();
             await audioTransport.connect({ ip: '127.0.0.1', port: audioPort });
             audioConsumer = await audioTransport.consume({
                 producerId: audioProducer.id,
@@ -351,6 +422,22 @@ async function startLiveHlsForRoom(roomId) {
         });
         ffmpeg.on('close', (code) => {
             log.info(`[live-hls ${roomId}] ffmpeg exited code=${code}`);
+            // If ffmpeg dies very quickly after start, record a failure so the
+            // session-watcher backs off instead of hot-looping spawns.
+            const pNow = liveHlsPipelines.get(roomId);
+            const ranMs = pNow && pNow.startedAt ? Date.now() - pNow.startedAt : 0;
+            if (code !== 0 && ranMs < 5000) {
+                const st = liveHlsRestartState.get(roomId) || { failCount: 0 };
+                st.failCount = (st.failCount || 0) + 1;
+                st.lastFailAt = Date.now();
+                // Exponential backoff: 2s, 4s, 8s, capped at 30s
+                const backoffMs = Math.min(30000, 2000 * Math.pow(2, st.failCount - 1));
+                st.nextAllowedAt = Date.now() + backoffMs;
+                liveHlsRestartState.set(roomId, st);
+                log.error(`[live-hls ${roomId}] ffmpeg crashed within ${ranMs}ms (code=${code}); backoff ${backoffMs}ms (fail #${st.failCount})`);
+            } else if (code === 0) {
+                liveHlsRestartState.delete(roomId);
+            }
             stopLiveHlsForRoom(roomId).catch(() => {});
         });
 
@@ -450,6 +537,10 @@ function maybeStartLiveHlsForRoom(roomId) {
         return;
     }
     if (liveHlsPipelines.has(roomId)) return;
+    const st = liveHlsRestartState.get(roomId);
+    if (st && st.nextAllowedAt && Date.now() < st.nextAllowedAt) {
+        return; // silent skip during backoff
+    }
     log.info(`[live-hls ${roomId}] auto-start triggered`);
     startLiveHlsForRoom(roomId).catch((e) =>
         log.error(`[live-hls ${roomId}] auto-start failed:`, e.message),
@@ -1538,9 +1629,14 @@ function startServer() {
                     return;
                 }
                 if (hasMediasoupRoom(normalizedRoomId)) {
-                    startLiveHlsForRoom(normalizedRoomId).catch((e) =>
-                        log.error(`[live-hls ${normalizedRoomId}] watcher start failed:`, e.message),
-                    );
+                    // Use maybeStartLiveHlsForRoom so the exponential-backoff
+                    // state (liveHlsRestartState) is respected; otherwise a
+                    // crashing ffmpeg would be relaunched every second.
+                    try {
+                        maybeStartLiveHlsForRoom(normalizedRoomId);
+                    } catch (e) {
+                        log.error(`[live-hls ${normalizedRoomId}] watcher start failed:`, e && e.message);
+                    }
                 }
             }, 1000);
         }
