@@ -373,15 +373,19 @@ async function startLiveHlsForRoom(roomId) {
             producerId: videoProducer.id,
             rtpCapabilities: router.rtpCapabilities,
             paused: true,
-            // For simulcast producers, pin to the lowest spatial layer (r0)
-            // which is typically the most reliable. Without this the consumer
-            // can flip between layers and starve ffmpeg of keyframes.
-            preferredLayers: { spatialLayer: 0, temporalLayer: 0 },
+            // Simulcast producer'larda EN YUKSEK spatial+temporal katmani sec:
+            //   spatialLayer 2 = HD katman (~720p, 30fps)
+            //   spatialLayer 0 = en dusuk katman (~180p, 10-15fps) -> FFmpeg'in
+            //     "More than 1000 frames duplicated" yazip izleyicide donma
+            //     hissi vermesinin asil sebebi buydu.
+            // Yayinci simulcast yapmiyorsa (tek katman) mediasoup otomatik
+            // mevcut en yuksege clamp eder; kotu bir senaryo yok.
+            preferredLayers: { spatialLayer: 2, temporalLayer: 2 },
         });
 
-        // Lock the layer hard so mediasoup BWE doesn't switch us mid-stream.
+        // Lock the layer hard so mediasoup BWE doesn't downgrade us mid-stream.
         try {
-            await videoConsumer.setPreferredLayers({ spatialLayer: 0, temporalLayer: 0 });
+            await videoConsumer.setPreferredLayers({ spatialLayer: 2, temporalLayer: 2 });
         } catch (_) {}
 
         if (audioProducer) {
@@ -434,10 +438,14 @@ async function startLiveHlsForRoom(roomId) {
                 '-level', '3.1',
                 '-pix_fmt', 'yuv420p',
                 '-vf', 'scale=-2:720,format=yuv420p',
-                '-fps_mode', 'cfr',
-                '-r', '24',
-                '-g', '48',
-                '-keyint_min', '48',
+                // VFR (passthrough timestamps): kaynak <24fps verirse
+                // duplicate frame uretmek yerine olan FPS'i koru. Bu hem
+                // CPU'yu dusurur hem de izleyici tarafinda "ayni kare 200ms
+                // donuyor sonra zipliyor" hissini ortadan kaldirir.
+                // -r yok; HLS keyframe alignment frame-bazli -g yerine
+                // zaman-bazli -force_key_frames ile saglaniyor (FPS ne olursa
+                // olsun her 2sn'de IDR -> her segment kendi keyframe'i ile baslar).
+                '-force_key_frames', 'expr:gte(t,n_forced*2)',
                 '-sc_threshold', '0',
                 '-threads', '4',
                 '-b:v', '1200k',
@@ -448,6 +456,10 @@ async function startLiveHlsForRoom(roomId) {
 
         const ffmpegArgs = [
             '-loglevel', 'warning',
+            // -stats: warning seviyesinde bile periyodik "frame=.. fps=.. bitrate=.."
+            // progress satirlarini stderr'e yazar. Live yayinin gercek FPS'i ve
+            // bitrate'ini izlemek icin gerekli. Yaklasik 2sn'de bir satir basar.
+            '-stats',
             '-protocol_whitelist', 'file,udp,rtp',
             // NOTE: do NOT use +genpts here. RTP packets carry their own
             // timestamps; +genpts would overwrite them with a frame counter
