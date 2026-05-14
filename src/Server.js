@@ -446,17 +446,23 @@ async function startLiveHlsForRoom(roomId) {
                 ? ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2']
                 : []),
             '-f', 'hls',
-            // Low-latency HLS: 1s segments, short list. Apple recommends
-            // 6s for VOD but for live broadcast we trade buffer depth for
-            // glass-to-glass latency.
+            // Low-latency HLS (LL-HLS-ish): fMP4 (CMAF) segments, 1s
+            // duration, short playlist window. fMP4 + independent_segments
+            // matches the VOD pipeline (media-server.js) and is natively
+            // supported by react-native-video (ExoPlayer + AVPlayer).
+            // +temp_file ensures players never read half-written segments
+            // (a frequent cause of stalls on slow networks). Apple
+            // recommends 6s for VOD but for live broadcast we trade
+            // buffer depth for glass-to-glass latency (~2-3s end-to-end).
             '-hls_time', '1',
-            '-hls_list_size', '4',
+            '-hls_list_size', '6',
             '-hls_flags', resumeFromExisting
-                ? 'delete_segments+independent_segments+omit_endlist+program_date_time+append_list'
-                : 'delete_segments+independent_segments+omit_endlist+program_date_time',
-            '-hls_segment_type', 'mpegts',
+                ? 'delete_segments+independent_segments+omit_endlist+program_date_time+temp_file+append_list'
+                : 'delete_segments+independent_segments+omit_endlist+program_date_time+temp_file',
+            '-hls_segment_type', 'fmp4',
+            '-hls_fmp4_init_filename', 'init.mp4',
             '-start_number', String(startNumber),
-            '-hls_segment_filename', path.join(hlsDir, 'seg_%05d.ts'),
+            '-hls_segment_filename', path.join(hlsDir, 'seg_%05d.m4s'),
             path.join(hlsDir, 'index.m3u8'),
         ];
 
