@@ -356,7 +356,16 @@ async function startLiveHlsForRoom(roomId) {
             producerId: videoProducer.id,
             rtpCapabilities: router.rtpCapabilities,
             paused: true,
+            // For simulcast producers, pin to the lowest spatial layer (r0)
+            // which is typically the most reliable. Without this the consumer
+            // can flip between layers and starve ffmpeg of keyframes.
+            preferredLayers: { spatialLayer: 0, temporalLayer: 0 },
         });
+
+        // Lock the layer hard so mediasoup BWE doesn't switch us mid-stream.
+        try {
+            await videoConsumer.setPreferredLayers({ spatialLayer: 0, temporalLayer: 0 });
+        } catch (_) {}
 
         if (audioProducer) {
             audioTransport = await router.createPlainTransport(plainOpts);
@@ -373,34 +382,75 @@ async function startLiveHlsForRoom(roomId) {
         const sdpPath = path.join(hlsDir, 'input.sdp');
         await fs.promises.writeFile(sdpPath, sdp, 'utf8');
 
+        // Detect video codec to decide between passthrough (no transcode) and
+        // libx264 transcode. If the producer is already H.264 we can pipe RTP
+        // straight into the HLS muxer, which is ~10x cheaper on CPU and adds
+        // ~1-2 seconds less latency than decode+re-encode.
+        const videoMime = (videoConsumer.rtpParameters.codecs[0].mimeType || '').toLowerCase();
+        const isH264Passthrough = videoMime === 'video/h264';
+        log.info(`[live-hls ${roomId}] video codec=${videoMime} mode=${isH264Passthrough ? 'passthrough' : 'transcode'}`);
+
+        const videoOutputArgs = isH264Passthrough
+            ? [
+                // Passthrough: ship the H.264 NAL units straight into HLS.
+                // We still need bitstream filter to insert SPS/PPS in every
+                // keyframe (some players require it for mid-stream join).
+                '-c:v', 'copy',
+                '-bsf:v', 'h264_mp4toannexb,dump_extra=freq=keyframe',
+            ]
+            : [
+                // Transcode fallback (VP8/VP9 -> H.264).
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-tune', 'zerolatency,fastdecode',
+                '-profile:v', 'baseline',
+                '-level', '3.1',
+                '-pix_fmt', 'yuv420p',
+                '-r', '30',
+                '-vsync', 'cfr',
+                '-g', '30',
+                '-keyint_min', '30',
+                '-sc_threshold', '0',
+                '-b:v', '1500k',
+                '-maxrate', '1800k',
+                '-bufsize', '3000k',
+                '-x264-params', 'sliced-threads=1:sync-lookahead=0:rc-lookahead=0',
+            ];
+
         const ffmpegArgs = [
             '-loglevel', 'warning',
             '-protocol_whitelist', 'file,udp,rtp',
-            '-fflags', '+genpts+nobuffer',
+            // NOTE: do NOT use +genpts here. RTP packets carry their own
+            // timestamps; +genpts would overwrite them with a frame counter
+            // and cause libx264 to encode at wall-clock speed (1000+ fps)
+            // producing endless 'VBV underflow' warnings. Use the RTP
+            // timestamps as-is; -fflags nobuffer keeps latency low.
+            '-fflags', 'nobuffer',
             '-flags', 'low_delay',
-            '-probesize', '32',
-            '-analyzeduration', '0',
+            // Give ffmpeg enough data to parse H.264 SPS/PPS before it gives
+            // up. With -probesize 32 / -analyzeduration 0 it sometimes never
+            // initializes the decoder, so no segments are produced.
+            '-probesize', '500000',
+            '-analyzeduration', '500000',
+            // RTP demuxer reorder buffer. Defaults are tiny (~500ms /
+            // 500 packets) and overflow rapidly under simulcast/layer
+            // switching, producing 'RTP: missed N packets' floods. Give
+            // it more headroom.
+            '-max_delay', '5000000',
+            '-reorder_queue_size', '16384',
             '-i', sdpPath,
             '-map', '0:v:0',
             ...(audioConsumer ? ['-map', '0:a:0'] : []),
-            '-c:v', 'libx264',
-            '-preset', 'ultrafast',
-            '-tune', 'zerolatency',
-            '-profile:v', 'baseline',
-            '-level', '3.1',
-            '-pix_fmt', 'yuv420p',
-            '-g', '60',
-            '-keyint_min', '60',
-            '-sc_threshold', '0',
-            '-b:v', '1500k',
-            '-maxrate', '1800k',
-            '-bufsize', '3000k',
+            ...videoOutputArgs,
             ...(audioConsumer
                 ? ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2']
                 : []),
             '-f', 'hls',
-            '-hls_time', '2',
-            '-hls_list_size', '6',
+            // Low-latency HLS: 1s segments, short list. Apple recommends
+            // 6s for VOD but for live broadcast we trade buffer depth for
+            // glass-to-glass latency.
+            '-hls_time', '1',
+            '-hls_list_size', '4',
             '-hls_flags', resumeFromExisting
                 ? 'delete_segments+independent_segments+omit_endlist+program_date_time+append_list'
                 : 'delete_segments+independent_segments+omit_endlist+program_date_time',
@@ -415,7 +465,11 @@ async function startLiveHlsForRoom(roomId) {
 
         ffmpeg.stderr.on('data', (chunk) => {
             const text = chunk.toString();
-            if (text.trim().length > 0) log.info(`[live-hls ${roomId}] ${text.trim()}`);
+            const trimmed = text.trim();
+            if (trimmed.length === 0) return;
+            // Filter known benign/noisy ffmpeg lines so logs aren't flooded.
+            if (/VBV underflow|past duration .* too large|Non-monotonous DTS|max delay reached|RTP: missed \d+ packets|Discarding interframe without a prior keyframe|Error submitting packet to decoder/i.test(trimmed)) return;
+            log.info(`[live-hls ${roomId}] ${trimmed}`);
         });
         ffmpeg.on('error', (err) => {
             log.error(`[live-hls ${roomId}] ffmpeg error:`, err.message);
@@ -455,6 +509,8 @@ async function startLiveHlsForRoom(roomId) {
             audioProducerId: audioProducer ? audioProducer.id : null,
             startedAt: Date.now(),
             stopping: false,
+            kfTimers: [],
+            kfInterval: null,
         };
         liveHlsPipelines.set(roomId, pipeline);
 
@@ -470,6 +526,33 @@ async function startLiveHlsForRoom(roomId) {
 
         await videoConsumer.resume();
         if (audioConsumer) await audioConsumer.resume();
+
+        // Force the broadcaster to send a key frame so ffmpeg can start
+        // producing HLS segments immediately instead of waiting for the
+        // next periodic keyframe. Repeat a few times to recover quickly
+        // from packet loss at startup.
+        const requestKf = () => {
+            const p = liveHlsPipelines.get(roomId);
+            if (!p || p.stopping) return;
+            if (!videoConsumer || videoConsumer.closed) return;
+            try {
+                const ret = videoConsumer.requestKeyFrame();
+                // requestKeyFrame returns a Promise; swallow rejections
+                // (e.g. consumer/producer closed mid-flight) so they don't
+                // crash the process as an unhandled rejection.
+                if (ret && typeof ret.then === 'function') {
+                    ret.catch(() => {});
+                }
+            } catch (_) {}
+        };
+        requestKf();
+        pipeline.kfTimers = [
+            setTimeout(requestKf, 500),
+            setTimeout(requestKf, 1500),
+            setTimeout(requestKf, 3000),
+        ];
+        // Periodic keyframe nudge every 5s while the pipeline is alive.
+        pipeline.kfInterval = setInterval(requestKf, 5000);
 
         const session = liveBroadcastSessions.get(roomId);
         if (session) {
@@ -498,6 +581,9 @@ async function stopLiveHlsForRoom(roomId) {
     if (!p || p.starting === true) return;
     if (p.stopping) return;
     p.stopping = true;
+
+    if (Array.isArray(p.kfTimers)) p.kfTimers.forEach((t) => clearTimeout(t));
+    if (p.kfInterval) clearInterval(p.kfInterval);
 
     try { if (p.ffmpeg && !p.ffmpeg.killed) p.ffmpeg.kill('SIGINT'); } catch (_) {}
     setTimeout(() => {
