@@ -218,24 +218,38 @@ function scheduleRoomTeardown(roomId) {
 }
 
 // Initialize Mediasoup Workers
+// Each worker is single-threaded; one per CPU core gives best throughput.
 async function runMediasoupWorkers() {
-  //const numWorkers = Math.min(os.cpus().length, 4);
-  const numWorkers = 1;
-  console.log(`Creating ${numWorkers} mediasoup workers...`);
+  const envCount = parseInt(process.env.MEDIASOUP_NUM_WORKERS, 10);
+  const numWorkers = Number.isFinite(envCount) && envCount > 0
+    ? envCount
+    : Math.min(os.cpus().length, 8);
+  console.log(`Creating ${numWorkers} mediasoup workers (cpus=${os.cpus().length})...`);
+
+  // Spread the RTP port range evenly across workers so each gets a
+  // disjoint slice; otherwise two workers race for the same UDP ports.
+  const totalPorts = mediasoupConfig.worker.rtcMaxPort - mediasoupConfig.worker.rtcMinPort + 1;
+  const portsPerWorker = Math.floor(totalPorts / numWorkers);
 
   for (let i = 0; i < numWorkers; i++) {
+    const rtcMinPort = mediasoupConfig.worker.rtcMinPort + i * portsPerWorker;
+    const rtcMaxPort = i === numWorkers - 1
+      ? mediasoupConfig.worker.rtcMaxPort
+      : rtcMinPort + portsPerWorker - 1;
+
     const worker = await mediasoup.createWorker({
       logLevel: mediasoupConfig.worker.logLevel,
       logTags: mediasoupConfig.worker.logTags,
-      rtcMinPort: mediasoupConfig.worker.rtcMinPort,
-      rtcMaxPort: mediasoupConfig.worker.rtcMaxPort,
+      rtcMinPort,
+      rtcMaxPort,
     });
 
     worker.on('died', () => {
-      console.error('Mediasoup worker died, exiting...');
+      console.error(`Mediasoup worker ${i} died, exiting...`);
       process.exit(1);
     });
 
+    console.log(`Worker ${i} ready (ports ${rtcMinPort}-${rtcMaxPort})`);
     workers.push(worker);
   }
 }

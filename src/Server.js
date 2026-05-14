@@ -72,6 +72,7 @@ const slackEnabled = config.slack.enabled;
 const slackSigningSecret = config.slack.signingSecret;
 const bodyParser = require('body-parser');
 const { S3 } = require('@aws-sdk/client-s3');
+const { createSpacesHlsUploader } = require('./SpacesHlsUploader');
 const { spawn } = require('child_process');
 const os = require('os');
 require('dotenv').config();
@@ -84,6 +85,22 @@ const SPACES_KEY = process.env.SPACES_KEY;
 const SPACES_SECRET = process.env.SPACES_SECRET;
 const SPACES_BUCKET = process.env.SPACES_BUCKET;
 const SPACES_REGION = process.env.SPACES_REGION;
+
+// Live HLS → Spaces CDN config
+// SPACES_PUBLIC_BASE_URL: CDN/edge URL viewers fetch HLS from (e.g.
+//   https://hissechat.fra1.cdn.digitaloceanspaces.com). When set, viewer
+//   playlists are served from Spaces and the droplet's egress bandwidth stays
+//   flat regardless of viewer count.
+// SPACES_HLS_PREFIX: key prefix inside the bucket; default 'live'. Each room
+//   is stored under `<prefix>/<roomId>/{index.m3u8,init.mp4,seg_*.m4s}`.
+// SPACES_HLS_RETENTION_SEC: seconds to keep objects after pipeline stop
+//   before bulk-delete. Default 600 (10 min) — enough for replay buffers.
+const SPACES_PUBLIC_BASE_URL = String(process.env.SPACES_PUBLIC_BASE_URL || '').trim();
+const SPACES_HLS_PREFIX = (process.env.SPACES_HLS_PREFIX || 'live').replace(/^\/+|\/+$/g, '');
+const SPACES_HLS_RETENTION_SEC = (() => {
+    const n = parseInt(process.env.SPACES_HLS_RETENTION_SEC, 10);
+    return Number.isFinite(n) ? n : 600;
+})();
 
 // ============================================================================
 // LIVE HLS BROADCAST PIPELINE (PlainTransport -> FFmpeg -> HLS)
@@ -399,21 +416,33 @@ async function startLiveHlsForRoom(roomId) {
                 '-bsf:v', 'h264_mp4toannexb,dump_extra=freq=keyframe',
             ]
             : [
-                // Transcode fallback (VP8/VP9 -> H.264).
+                // Transcode fallback (VP8/VP9 -> H.264). Mobile-friendly
+                // settings for React Native Video (ExoPlayer / AVPlayer):
+                // CFR 24fps is enough for talking-head content and avoids
+                // duplicating frames from sources that don't hit 30fps.
+                // GOP 48 (2s) aligns with hls_time=2 so every segment
+                // starts with an IDR -> seamless ABR / mid-stream join.
+                // ultrafast + scaled 720p + threaded encoding: tarayıcı/cihaz
+                // H.264 yerine VP8 yolladığında transcode kaçınılmaz. CPU
+                // bütçesini taşmaması için: çözünürlük 720p'ye düşürülür
+                // (mobil için zaten yeterli), preset ultrafast, x264 thread
+                // limiti 4 (8vCPU'da diğer yayınlara yer bırakır).
                 '-c:v', 'libx264',
                 '-preset', 'ultrafast',
-                '-tune', 'zerolatency,fastdecode',
+                '-tune', 'zerolatency',
                 '-profile:v', 'baseline',
                 '-level', '3.1',
                 '-pix_fmt', 'yuv420p',
-                '-r', '30',
-                '-vsync', 'cfr',
-                '-g', '30',
-                '-keyint_min', '30',
+                '-vf', 'scale=-2:720,format=yuv420p',
+                '-fps_mode', 'cfr',
+                '-r', '24',
+                '-g', '48',
+                '-keyint_min', '48',
                 '-sc_threshold', '0',
-                '-b:v', '1500k',
-                '-maxrate', '1800k',
-                '-bufsize', '3000k',
+                '-threads', '4',
+                '-b:v', '1200k',
+                '-maxrate', '1400k',
+                '-bufsize', '2800k',
                 '-x264-params', 'sliced-threads=1:sync-lookahead=0:rc-lookahead=0',
             ];
 
@@ -443,19 +472,21 @@ async function startLiveHlsForRoom(roomId) {
             ...(audioConsumer ? ['-map', '0:a:0'] : []),
             ...videoOutputArgs,
             ...(audioConsumer
-                ? ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2']
+                ? ['-c:a', 'aac', '-b:a', '96k', '-ar', '48000', '-ac', '2',
+                   // aresample async=1 absorbs RTP jitter and resamples to a
+                   // monotonic PTS instead of FFmpeg printing "Non-monotonic
+                   // DTS" warnings + occasional audio drops on the client.
+                   '-af', 'aresample=async=1:first_pts=0']
                 : []),
             '-f', 'hls',
-            // Low-latency HLS (LL-HLS-ish): fMP4 (CMAF) segments, 1s
-            // duration, short playlist window. fMP4 + independent_segments
-            // matches the VOD pipeline (media-server.js) and is natively
-            // supported by react-native-video (ExoPlayer + AVPlayer).
-            // +temp_file ensures players never read half-written segments
-            // (a frequent cause of stalls on slow networks). Apple
-            // recommends 6s for VOD but for live broadcast we trade
-            // buffer depth for glass-to-glass latency (~2-3s end-to-end).
-            '-hls_time', '1',
-            '-hls_list_size', '6',
+            // Mobile-friendly HLS: 2s segments x 8 list = 16s playlist
+            // window. Bigger than LL-HLS but much more resilient to mobile
+            // network jitter (TCP slow-start has time to ramp, players can
+            // pre-buffer ~3-4 segments before showing first frame).
+            // Glass-to-glass latency ~6-10s, acceptable for broadcast.
+            // +temp_file ensures players never read half-written segments.
+            '-hls_time', '2',
+            '-hls_list_size', '8',
             '-hls_flags', resumeFromExisting
                 ? 'delete_segments+independent_segments+omit_endlist+program_date_time+temp_file+append_list'
                 : 'delete_segments+independent_segments+omit_endlist+program_date_time+temp_file',
@@ -517,8 +548,30 @@ async function startLiveHlsForRoom(roomId) {
             stopping: false,
             kfTimers: [],
             kfInterval: null,
+            uploader: null,
         };
         liveHlsPipelines.set(roomId, pipeline);
+
+        // Mirror HLS output to Spaces so the CDN serves viewers and the droplet
+        // egress doesn't scale with audience size. Disabled automatically if
+        // SPACES_PUBLIC_BASE_URL is empty (local-only mode for dev).
+        if (SPACES_PUBLIC_BASE_URL && SPACES_BUCKET) {
+            const s3 = getSpacesClient();
+            if (s3) {
+                try {
+                    pipeline.uploader = createSpacesHlsUploader({
+                        s3,
+                        bucket: SPACES_BUCKET,
+                        localDir: hlsDir,
+                        keyPrefix: `${SPACES_HLS_PREFIX}/${sanitizeRoomIdForPath(roomId)}`,
+                        logInfo: (m) => log.info(`[live-hls ${roomId}] ${m}`),
+                        logError: (m) => log.error(`[live-hls ${roomId}] ${m}`),
+                    });
+                } catch (e) {
+                    log.error(`[live-hls ${roomId}] uploader init failed: ${e.message}`);
+                }
+            }
+        }
 
         videoConsumer.on('producerclose', () => {
             log.info(`[live-hls ${roomId}] video producer closed`);
@@ -602,6 +655,21 @@ async function stopLiveHlsForRoom(roomId) {
     try { if (p.audioTransport && !p.audioTransport.closed) p.audioTransport.close(); } catch (_) {}
     freeLiveRtpPort(p.videoPort);
     freeLiveRtpPort(p.audioPort);
+
+    // Stop the Spaces uploader (drain in-flight PUTs) and schedule a remote
+    // cleanup after the retention window so late viewers can finish playing.
+    if (p.uploader) {
+        const up = p.uploader;
+        Promise.resolve()
+            .then(() => up.stop())
+            .then(() => {
+                if (SPACES_HLS_RETENTION_SEC <= 0) return up.deleteRemote();
+                setTimeout(() => {
+                    up.deleteRemote().catch(() => {});
+                }, SPACES_HLS_RETENTION_SEC * 1000).unref();
+            })
+            .catch((e) => log.error(`[live-hls ${roomId}] uploader teardown: ${e.message}`));
+    }
 
     liveHlsPipelines.delete(roomId);
 
@@ -1664,7 +1732,11 @@ function startServer() {
         const { roomId, title, channelId, startTime, scheduledEndTime } = req.body || {};
         const normalizedRoomId = String(roomId || '').trim() || `broadcast-${Date.now()}`;
         const sessionId = `live-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        const hlsUrl = `${LIVE_HLS_BASE_URL.replace(/\/$/, '')}/${encodeURIComponent(
+        // Prefer Spaces CDN when configured; falls back to droplet-served URL otherwise.
+        const playbackBase = SPACES_PUBLIC_BASE_URL
+            ? `${SPACES_PUBLIC_BASE_URL.replace(/\/$/, '')}/${SPACES_HLS_PREFIX}`
+            : LIVE_HLS_BASE_URL.replace(/\/$/, '');
+        const hlsUrl = `${playbackBase}/${encodeURIComponent(
             normalizedRoomId,
         )}/index.m3u8`;
 

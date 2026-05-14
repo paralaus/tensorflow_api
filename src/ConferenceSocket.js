@@ -170,23 +170,42 @@ async function persistKickOnBackend(roomId, targetUserId, hostToken) {
 }
 
 // Initialize Mediasoup Workers
+// Each worker is single-threaded; one per CPU core gives best throughput.
+// Cap configurable via MEDIASOUP_NUM_WORKERS env (defaults to number of CPUs,
+// max 8 so a stray giant droplet doesn't blow port ranges).
+const os = require('os');
 async function runMediasoupWorkers() {
-  const numWorkers = 1;
-  console.log(`[ConferenceSocket] Creating ${numWorkers} mediasoup workers...`);
+  const envCount = parseInt(process.env.MEDIASOUP_NUM_WORKERS, 10);
+  const numWorkers = Number.isFinite(envCount) && envCount > 0
+    ? envCount
+    : Math.min(os.cpus().length, 8);
+  console.log(`[ConferenceSocket] Creating ${numWorkers} mediasoup workers (cpus=${os.cpus().length})...`);
+
+  // Spread the configured RTP port range evenly across workers so each
+  // worker gets a disjoint slice. Without this, two workers would fight
+  // for the same port pool and randomly fail on bind.
+  const totalPorts = mediasoupConfig.worker.rtcMaxPort - mediasoupConfig.worker.rtcMinPort + 1;
+  const portsPerWorker = Math.floor(totalPorts / numWorkers);
 
   for (let i = 0; i < numWorkers; i++) {
+    const rtcMinPort = mediasoupConfig.worker.rtcMinPort + i * portsPerWorker;
+    const rtcMaxPort = i === numWorkers - 1
+      ? mediasoupConfig.worker.rtcMaxPort
+      : rtcMinPort + portsPerWorker - 1;
+
     const worker = await mediasoup.createWorker({
       logLevel: mediasoupConfig.worker.logLevel,
       logTags: mediasoupConfig.worker.logTags,
-      rtcMinPort: mediasoupConfig.worker.rtcMinPort,
-      rtcMaxPort: mediasoupConfig.worker.rtcMaxPort,
+      rtcMinPort,
+      rtcMaxPort,
     });
 
     worker.on('died', () => {
-      console.error('[ConferenceSocket] Mediasoup worker died, exiting...');
+      console.error(`[ConferenceSocket] Mediasoup worker ${i} died, exiting...`);
       process.exit(1); // Careful with this in shared process
     });
 
+    console.log(`[ConferenceSocket] Worker ${i} ready (ports ${rtcMinPort}-${rtcMaxPort})`);
     workers.push(worker);
   }
 }
