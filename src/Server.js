@@ -102,6 +102,30 @@ const SPACES_HLS_RETENTION_SEC = (() => {
     return Number.isFinite(n) ? n : 600;
 })();
 
+// LIVE_HLS_VOD_ENABLED: "Replay (VOD)" — yayin bittikten sonra video kalici
+// olsun mu? true ise:
+//   * Canli sirasinda FFmpeg'in `delete_segments` bayragi kaldirilir ve
+//     `hls_list_size=0` yapilir; tum segmentler diskte ve Spaces'te kalir
+//     (~50MB/saat @ 1.2Mbps).
+//   * Yayin bitince playlist `#EXT-X-PLAYLIST-TYPE:VOD` + `#EXT-X-ENDLIST`
+//     ile finalize edilir ve Spaces'e son hali yuklenir.
+//   * `deleteRemote()` cagrilmaz; ayni `index.m3u8` URL'i replay olarak
+//     calismaya devam eder.
+// SPACES yapilandirilmissa default ON. Manuel kapatmak icin '0' ver.
+const LIVE_HLS_VOD_ENABLED = (() => {
+    const v = String(process.env.LIVE_HLS_VOD_ENABLED || '').trim().toLowerCase();
+    if (v === '1' || v === 'true' || v === 'yes' || v === 'on') return true;
+    if (v === '0' || v === 'false' || v === 'no' || v === 'off') return false;
+    return Boolean(SPACES_PUBLIC_BASE_URL && SPACES_BUCKET);
+})();
+
+// VOD finalize edildikten sonra lokal kopyayi diskte ne kadar tutalim.
+// Spaces'e mirror edildigi icin lokali silmek guvenli; default 1 saat.
+const LIVE_HLS_VOD_LOCAL_CLEANUP_SEC = (() => {
+    const n = parseInt(process.env.LIVE_HLS_VOD_LOCAL_CLEANUP_SEC, 10);
+    return Number.isFinite(n) ? n : 3600;
+})();
+
 // ============================================================================
 // LIVE HLS BROADCAST PIPELINE (PlainTransport -> FFmpeg -> HLS)
 // Ported from media-server.js so that the conference mediasoup router
@@ -228,6 +252,34 @@ async function reserveBindableUdpPort() {
 
 function sanitizeRoomIdForPath(roomId) {
     return String(roomId).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80) || 'room';
+}
+
+// Yayin bittikten sonra HLS playlist'i "VOD" formatina cevirir:
+//   * #EXT-X-PLAYLIST-TYPE:VOD baslik ekler (yoksa)
+//   * Sonuna #EXT-X-ENDLIST ekler (player'a "akis bitti, basa sarilabilir"
+//     sinyali verir; seek bar dolu gozukur).
+// Yazma sonrasi fs.watch'i tetikleyip Spaces'e son hali itmek arayanin sorumlulugu.
+async function finalizeVodPlaylist(roomId, hlsDir) {
+    const playlistPath = path.join(hlsDir, 'index.m3u8');
+    let text;
+    try {
+        text = await fs.promises.readFile(playlistPath, 'utf8');
+    } catch (e) {
+        log.error(`[live-hls ${roomId}] vod finalize read failed: ${e.message}`);
+        return null;
+    }
+    if (/#EXT-X-ENDLIST/.test(text)) return playlistPath; // zaten finalize
+
+    if (/#EXT-X-PLAYLIST-TYPE:/.test(text)) {
+        text = text.replace(/#EXT-X-PLAYLIST-TYPE:[A-Z]+/, '#EXT-X-PLAYLIST-TYPE:VOD');
+    } else {
+        text = text.replace(/(#EXTM3U\s*\n)/, '$1#EXT-X-PLAYLIST-TYPE:VOD\n');
+    }
+    if (!text.endsWith('\n')) text += '\n';
+    text += '#EXT-X-ENDLIST\n';
+    await fs.promises.writeFile(playlistPath, text, 'utf8');
+    log.info(`[live-hls ${roomId}] vod playlist finalized (${text.length} bytes)`);
+    return playlistPath;
 }
 
 // Pick the first video (and optionally audio) producer in a Room.
@@ -498,10 +550,19 @@ async function startLiveHlsForRoom(roomId) {
             // Glass-to-glass latency ~6-10s, acceptable for broadcast.
             // +temp_file ensures players never read half-written segments.
             '-hls_time', '2',
-            '-hls_list_size', '8',
-            '-hls_flags', resumeFromExisting
-                ? 'delete_segments+independent_segments+omit_endlist+program_date_time+temp_file+append_list'
-                : 'delete_segments+independent_segments+omit_endlist+program_date_time+temp_file',
+            // VOD modunda kayan pencere YOK; tum segmentler kalir ki yayin
+            // bittikten sonra basa sarilabilsin. Canli modda mobil network
+            // jitter'a dayanikli 8x2sn=16sn pencere kullaniriz.
+            '-hls_list_size', LIVE_HLS_VOD_ENABLED ? '0' : '8',
+            '-hls_flags', (() => {
+                // delete_segments: live moddayken eski segmentleri diskten
+                //   ve playlistten siler. VOD'da ASLA olmamali, yoksa replay
+                //   yapacak segment kalmaz.
+                const base = LIVE_HLS_VOD_ENABLED
+                    ? 'independent_segments+omit_endlist+program_date_time+temp_file'
+                    : 'delete_segments+independent_segments+omit_endlist+program_date_time+temp_file';
+                return resumeFromExisting ? `${base}+append_list` : base;
+            })(),
             '-hls_segment_type', 'fmp4',
             '-hls_fmp4_init_filename', 'init.mp4',
             '-start_number', String(startNumber),
@@ -656,10 +717,23 @@ async function stopLiveHlsForRoom(roomId) {
     if (Array.isArray(p.kfTimers)) p.kfTimers.forEach((t) => clearTimeout(t));
     if (p.kfInterval) clearInterval(p.kfInterval);
 
-    try { if (p.ffmpeg && !p.ffmpeg.killed) p.ffmpeg.kill('SIGINT'); } catch (_) {}
-    setTimeout(() => {
-        try { if (p.ffmpeg && !p.ffmpeg.killed) p.ffmpeg.kill('SIGKILL'); } catch (_) {}
-    }, 3000);
+    // FFmpeg'e once SIGINT gonderip dogal kapanmasini bekleriz; bu sayede
+    // index.m3u8'in son hali (tum segmentler dahil) diske flush edilir.
+    // VOD finalize bu son playlist'in uzerinden yapilir.
+    if (p.ffmpeg && p.ffmpeg.exitCode === null && !p.ffmpeg.killed) {
+        try { p.ffmpeg.kill('SIGINT'); } catch (_) {}
+        await new Promise((resolve) => {
+            const killTimer = setTimeout(() => {
+                try { if (p.ffmpeg.exitCode === null) p.ffmpeg.kill('SIGKILL'); } catch (_) {}
+            }, 3000);
+            const doneTimer = setTimeout(() => resolve(), 5000); // ust sinir
+            p.ffmpeg.once('close', () => {
+                clearTimeout(killTimer);
+                clearTimeout(doneTimer);
+                resolve();
+            });
+        });
+    }
 
     try { if (p.videoConsumer && !p.videoConsumer.closed) p.videoConsumer.close(); } catch (_) {}
     try { if (p.audioConsumer && !p.audioConsumer.closed) p.audioConsumer.close(); } catch (_) {}
@@ -668,13 +742,34 @@ async function stopLiveHlsForRoom(roomId) {
     freeLiveRtpPort(p.videoPort);
     freeLiveRtpPort(p.audioPort);
 
-    // Stop the Spaces uploader (drain in-flight PUTs) and schedule a remote
-    // cleanup after the retention window so late viewers can finish playing.
+    // ---- VOD finalize (replay) ----
+    // Yayin bittikten sonra ayni playback URL'i VOD olarak servis edebilmek
+    // icin playlist'i ENDLIST ile kapatip Spaces'e son halini yazariz.
+    let vodFinalized = false;
+    if (LIVE_HLS_VOD_ENABLED && p.hlsDir) {
+        try {
+            const finalized = await finalizeVodPlaylist(roomId, p.hlsDir);
+            if (finalized) {
+                vodFinalized = true;
+                // fs.watch debounce penceresi (150ms) gecsin ki uploader
+                // finalize edilmis index.m3u8'i Spaces'e PUT'lasin; sonra
+                // uploader.stop() in-flight PUT'i drenaj eder.
+                await new Promise((r) => setTimeout(r, 300));
+            }
+        } catch (e) {
+            log.error(`[live-hls ${roomId}] vod finalize failed: ${e.message}`);
+        }
+    }
+
+    // Spaces uploader'i durdur (in-flight PUT'lari drenaj eder). VOD modunda
+    // ASLA deleteRemote cagirmiyoruz; aksi halde replay icin gereken
+    // segmentler silinir. Live-only modda eski davranis korunuyor.
     if (p.uploader) {
         const up = p.uploader;
         Promise.resolve()
             .then(() => up.stop())
             .then(() => {
+                if (vodFinalized) return; // VOD: segmentleri Spaces'te birak
                 if (SPACES_HLS_RETENTION_SEC <= 0) return up.deleteRemote();
                 setTimeout(() => {
                     up.deleteRemote().catch(() => {});
@@ -687,18 +782,30 @@ async function stopLiveHlsForRoom(roomId) {
 
     const session = liveBroadcastSessions.get(roomId);
     if (session) {
-        session.status = 'ended';
+        session.status = vodFinalized ? 'vod' : 'ended';
         session.streamEndedAt = new Date().toISOString();
+        if (vodFinalized) {
+            session.replayReady = true;
+            session.replayReadyAt = session.streamEndedAt;
+            // replayUrl == hlsUrl (ayni index.m3u8); player ENDLIST gorunce VOD oynatir.
+            session.replayUrl = session.hlsUrl;
+        }
     }
 
     if (p.hlsDir) {
+        // VOD: lokali daha uzun tut (CDN cold edge backfill marji). Live-only:
+        // 60 sn yeterli, segmentler zaten silinmis vaziyette.
+        const localTtlMs = vodFinalized
+            ? LIVE_HLS_VOD_LOCAL_CLEANUP_SEC * 1000
+            : 60 * 1000;
         const cleanupTimer = setTimeout(() => {
             liveHlsCleanupTimers.delete(roomId);
             fs.rm(p.hlsDir, { recursive: true, force: true }, () => {});
-        }, 60 * 1000);
+        }, localTtlMs);
+        if (cleanupTimer.unref) cleanupTimer.unref();
         liveHlsCleanupTimers.set(roomId, cleanupTimer);
     }
-    log.info(`[live-hls ${roomId}] pipeline stopped`);
+    log.info(`[live-hls ${roomId}] pipeline stopped${vodFinalized ? ' (vod ready)' : ''}`);
 }
 
 function maybeStartLiveHlsForRoom(roomId) {
@@ -1761,6 +1868,12 @@ function startServer() {
             scheduledEndTime: scheduledEndTime || null,
             hlsUrl,
             playbackUrl: hlsUrl,
+            // Replay (VOD): yayin bittikten sonra ayni URL VOD olarak servis
+            // eder (playlist'e EXT-X-ENDLIST eklenir). Client status='vod' ya
+            // da replayReady=true gorunce "sonradan izle" akisina gecebilir.
+            replayEnabled: LIVE_HLS_VOD_ENABLED,
+            replayUrl: LIVE_HLS_VOD_ENABLED ? hlsUrl : null,
+            replayReady: false,
             llhls: true,
             status: 'provisioned',
             createdAt: new Date().toISOString(),
