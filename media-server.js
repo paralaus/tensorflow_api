@@ -2,6 +2,8 @@ const express = require('express');
 const http = require('http');
 const https = require('https');
 const socketIo = require('socket.io');
+const { createAdapter } = require('@socket.io/redis-adapter');
+const Redis = require('ioredis');
 const mediasoup = require('mediasoup');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
@@ -2220,9 +2222,62 @@ app.post('/audio/transcode/from-url', async (req, res) => {
 // Health Check
 app.get('/health', (req, res) => res.status(200).send('Media Server OK'));
 
+// Redis adapter (opsiyonel, REDIS_URL tanımlıysa devreye girer).
+// Birden fazla media-server instance'ı Socket.IO eventlerini Redis pub/sub
+// üzerinden paylaşabilir. NOT: Mediasoup transport/producer/consumer
+// state'i process-local kalır; bu yüzden aynı odanın katılımcıları aynı
+// node'a yönlendirilmeli (LB üzerinden sticky session veya roomId tabanlı
+// consistent hashing). Adapter sadece cross-node `io.to(...).emit(...)`,
+// `socket.broadcast`, chat/typing/host-changed gibi event yayılımlarını
+// çözer.
+async function setupRedisAdapter() {
+  const redisUrl = String(process.env.REDIS_URL || '').trim();
+  if (!redisUrl) {
+    console.log('[redis-adapter] REDIS_URL not set, running in single-node mode');
+    return;
+  }
+  try {
+    const pubClient = new Redis(redisUrl, {
+      maxRetriesPerRequest: null,
+      enableReadyCheck: true,
+      lazyConnect: false,
+    });
+    const subClient = pubClient.duplicate();
+
+    pubClient.on('error', (err) =>
+      console.error('[redis-adapter] pub error:', err?.message),
+    );
+    subClient.on('error', (err) =>
+      console.error('[redis-adapter] sub error:', err?.message),
+    );
+
+    await Promise.all([
+      new Promise((resolve) =>
+        pubClient.status === 'ready' ? resolve() : pubClient.once('ready', resolve),
+      ),
+      new Promise((resolve) =>
+        subClient.status === 'ready' ? resolve() : subClient.once('ready', resolve),
+      ),
+    ]);
+
+    io.adapter(createAdapter(pubClient, subClient));
+    console.log(`[redis-adapter] connected (${redisUrl.replace(/\/\/[^@]*@/, '//***@')})`);
+  } catch (err) {
+    console.error(
+      '[redis-adapter] setup failed, falling back to single-node memory adapter:',
+      err?.message,
+    );
+  }
+}
+
 // Start Server
-runMediasoupWorkers().then(() => {
+(async () => {
+  await setupRedisAdapter();
+  await runMediasoupWorkers();
   server.listen(PORT, () => {
     console.log(`Media Server running on port ${PORT}`);
   });
+})().catch((err) => {
+  console.error('Fatal startup error:', err);
+  process.exit(1);
 });
