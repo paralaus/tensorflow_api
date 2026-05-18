@@ -204,6 +204,34 @@ def stats() -> dict:
     return {"backend": backend, "size": size, "default_ttl": DEFAULT_TTL, "negative_ttl": NEGATIVE_TTL}
 
 
+def clear_all(prefix: Optional[str] = None) -> dict:
+    """Cache'i temizle. prefix verilirse sadece o prefix'te olanlari siler.
+
+    Donen dict: {"backend": "...", "deleted": N}
+    """
+    pattern_prefix = prefix if prefix else KEY_PREFIX
+    deleted = 0
+    backend = "redis" if _redis is not None else "memory"
+    if _redis is not None:
+        try:
+            keys = list(_redis.scan_iter(match=f"{pattern_prefix}*", count=500))
+            if keys:
+                deleted = _redis.delete(*keys)
+        except Exception as e:
+            print(f"[cache] clear_all redis hata: {e}")
+    # Lokal cache'i de bosalt (hybrid mode olabilir)
+    with _local_lock:
+        if prefix:
+            to_del = [k for k in _local if k.startswith(pattern_prefix)]
+            for k in to_del:
+                _local.pop(k, None)
+            deleted += len(to_del)
+        else:
+            deleted += len(_local)
+            _local.clear()
+    return {"backend": backend, "deleted": int(deleted)}
+
+
 # ============== STALE-WHILE-REVALIDATE ==============
 # Single-flight: ayni key icin paralel refresh tetiklenmesin.
 # (_inflight ve _inflight_lock yukarida tanimli.)
