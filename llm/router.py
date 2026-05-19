@@ -546,6 +546,10 @@ class LlmRouter:
                 return out
             except Exception as e:
                 last_err = e
+                print(
+                    f"[llm_router] chat() {provider} failed: {type(e).__name__}: {e}",
+                    flush=True,
+                )
                 self._record_failure(provider)
                 if not self.failover_enabled:
                     break
@@ -584,6 +588,10 @@ class LlmRouter:
                 )
             except Exception as e:
                 last_err = e
+                print(
+                    f"[llm_router] stream_chat() {provider} failed: {type(e).__name__}: {e}",
+                    flush=True,
+                )
                 self._record_failure(provider)
                 if not self.failover_enabled:
                     break

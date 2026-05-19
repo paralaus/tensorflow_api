@@ -12,7 +12,7 @@ const JWT_SECRETS_ENV = process.env.JWT_SECRETS || process.env.JWT_SECRETS_LIST 
 const MEDIASOUP_MIN_PORT = parseInt(process.env.MEDIASOUP_MIN_PORT, 10) || 40000; // Safe range
 const MEDIASOUP_MAX_PORT = parseInt(process.env.MEDIASOUP_MAX_PORT, 10) || 40100;
 const MEDIASOUP_LISTEN_IP = process.env.MEDIASOUP_LISTEN_IP || '0.0.0.0';
-const MEDIASOUP_ANNOUNCED_IP = process.env.MEDIASOUP_ANNOUNCED_IP || '104.248.212.6'; // Public IP fallback
+const MEDIASOUP_ANNOUNCED_IP = process.env.MEDIASOUP_ANNOUNCED_IP || '161.35.16.190'; // Public IP fallback
 
 // ICE Servers Configuration (STUN + TURN)
 // TURN server is CRITICAL for mobile users behind symmetric NAT
