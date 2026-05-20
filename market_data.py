@@ -418,9 +418,12 @@ def build_market_context(question: str) -> str | None:
         f"(alındığı an: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}):\n"
     )
     footer = (
-        "\nKullanıcı sorusunu yanıtlarken YALNIZCA yukarıdaki güncel "
-        "sayıları referans al. Kendi eğitim verinden eski fiyat uydurma. "
-        "Fiyatları olduğu gibi belirt, yorumunu kısa tut."
+        "\n⚠️ TALİMAT: Yukarıdaki sayılar UYGULAMA TARAFINDAN ŞU AN ÇEKİLEN "
+        "CANLI piyasa verisidir. Kullanıcıya cevabında MUTLAKA bu sayıları kullan. "
+        "'Gerçek zamanlı veriye erişimim yok', 'güncel fiyatı bilemem', "
+        "'eğitim verim eski' gibi reddetme cümleleri KURMA — veri zaten elinde. "
+        "Kendi eğitim verinden eski fiyat uydurma; sadece yukarıdaki rakamları "
+        "olduğu gibi belirt ve kısa yorumla."
     )
     return header + "\n".join(lines) + footer
 

@@ -22,6 +22,8 @@ class LlmRouter:
         self.max_retries = int(os.environ.get("LLM_MAX_RETRIES", "1"))
         self.circuit_fails = int(os.environ.get("LLM_CIRCUIT_FAILS", "3"))
         self.circuit_cooldown_sec = int(os.environ.get("LLM_CIRCUIT_COOLDOWN_SEC", "60"))
+        # Kota/bakiye gibi kalici hatalarda kisa devreyi cok uzun tut (default 1 saat)
+        self.quota_cooldown_sec = int(os.environ.get("LLM_QUOTA_COOLDOWN_SEC", "3600"))
 
         self.models = {
             "groq": os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
@@ -86,6 +88,40 @@ class LlmRouter:
         if fails >= self.circuit_fails:
             open_until = time.time() + self.circuit_cooldown_sec
         self._circuit[provider] = {"fails": fails, "open_until": open_until}
+
+    @staticmethod
+    def _is_quota_error(err: BaseException) -> bool:
+        """Tanir: OpenAI insufficient_quota, Groq per-day TPD, generic billing 429'lari."""
+        msg = str(err).lower()
+        if "insufficient_quota" in msg or "exceeded_quota" in msg:
+            return True
+        if "tokens per day" in msg or "per-day" in msg or "(tpd)" in msg:
+            return True
+        if "billing" in msg and "429" in msg:
+            return True
+        return False
+
+    def _record_quota_exhausted(self, provider: str) -> None:
+        """Provider kalici olarak (uzun sure) devre disi: hammering yok."""
+        self._circuit[provider] = {
+            "fails": self.circuit_fails,
+            "open_until": time.time() + self.quota_cooldown_sec,
+        }
+
+    def reset_circuit(self, provider: Optional[str] = None) -> Dict[str, Any]:
+        """Belirtilen provider'in (veya hepsinin) circuit state'ini sifirla.
+
+        Restart gerektirmeden, ornegin OpenAI bakiyesi yuklendikten sonra
+        admin endpoint uzerinden cagrilabilir.
+        """
+        if provider:
+            p = provider.strip().lower()
+            existed = p in self._circuit
+            self._circuit.pop(p, None)
+            return {"reset": [p] if existed else [], "provider": p}
+        reset_list = list(self._circuit.keys())
+        self._circuit.clear()
+        return {"reset": reset_list}
 
     def _parse_route(self, raw: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
         if not raw or not isinstance(raw, str):
@@ -525,10 +561,21 @@ class LlmRouter:
         attempts: List[str] = []
         last_err: Optional[Exception] = None
 
+        # Tum saglikli aday devre disiysa (hepsi acik), en yakin acilacak olani half-open prob et.
+        # Bu, butun devreler ayni anda kapaninca /chat'in attempts=[] ile 500 donmesini engeller.
+        enabled_candidates = [p for p in candidates if self._is_enabled(p)]
+        healthy = [p for p in enabled_candidates if not self._is_circuit_open(p)]
+        half_open: Optional[str] = None
+        if not healthy and enabled_candidates:
+            half_open = min(
+                enabled_candidates,
+                key=lambda p: (self._circuit.get(p) or {}).get("open_until", 0),
+            )
+
         for provider in candidates:
             if not self._is_enabled(provider):
                 continue
-            if self._is_circuit_open(provider):
+            if self._is_circuit_open(provider) and provider != half_open:
                 continue
             attempts.append(provider)
             t0 = time.time()
@@ -546,11 +593,18 @@ class LlmRouter:
                 return out
             except Exception as e:
                 last_err = e
-                print(
-                    f"[llm_router] chat() {provider} failed: {type(e).__name__}: {e}",
-                    flush=True,
-                )
-                self._record_failure(provider)
+                if self._is_quota_error(e):
+                    print(
+                        f"[llm_router] chat() {provider} quota exhausted; cooling down {self.quota_cooldown_sec}s",
+                        flush=True,
+                    )
+                    self._record_quota_exhausted(provider)
+                else:
+                    print(
+                        f"[llm_router] chat() {provider} failed: {type(e).__name__}: {e}",
+                        flush=True,
+                    )
+                    self._record_failure(provider)
                 if not self.failover_enabled:
                     break
 
@@ -568,12 +622,24 @@ class LlmRouter:
         """Streaming support (phase-2): Groq, Together, OpenAI."""
         candidates = self._provider_candidates(preferred_provider)
         last_err: Optional[Exception] = None
+        stream_caps = ("groq", "together", "deepseek", "openai", "anthropic")
+        enabled_stream = [
+            p for p in candidates
+            if p in stream_caps and self._is_enabled(p)
+        ]
+        healthy = [p for p in enabled_stream if not self._is_circuit_open(p)]
+        half_open: Optional[str] = None
+        if not healthy and enabled_stream:
+            half_open = min(
+                enabled_stream,
+                key=lambda p: (self._circuit.get(p) or {}).get("open_until", 0),
+            )
         for provider in candidates:
-            if provider not in ("groq", "together", "deepseek", "openai", "anthropic"):
+            if provider not in stream_caps:
                 continue
             if not self._is_enabled(provider):
                 continue
-            if self._is_circuit_open(provider):
+            if self._is_circuit_open(provider) and provider != half_open:
                 continue
             try:
                 return self._stream_provider(
@@ -588,11 +654,18 @@ class LlmRouter:
                 )
             except Exception as e:
                 last_err = e
-                print(
-                    f"[llm_router] stream_chat() {provider} failed: {type(e).__name__}: {e}",
-                    flush=True,
-                )
-                self._record_failure(provider)
+                if self._is_quota_error(e):
+                    print(
+                        f"[llm_router] stream_chat() {provider} quota exhausted; cooling down {self.quota_cooldown_sec}s",
+                        flush=True,
+                    )
+                    self._record_quota_exhausted(provider)
+                else:
+                    print(
+                        f"[llm_router] stream_chat() {provider} failed: {type(e).__name__}: {e}",
+                        flush=True,
+                    )
+                    self._record_failure(provider)
                 if not self.failover_enabled:
                     break
                 continue
