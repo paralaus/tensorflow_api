@@ -14,7 +14,10 @@ class LlmRouter:
     def __init__(self) -> None:
         self.provider_order = [
             p.strip().lower()
-            for p in os.environ.get("LLM_PROVIDER_ORDER", "groq,together,deepseek,openai,anthropic").split(",")
+            for p in os.environ.get(
+                "LLM_PROVIDER_ORDER",
+                "digitalocean,groq,together,deepseek,openai,anthropic",
+            ).split(",")
             if p.strip()
         ]
         self.failover_enabled = os.environ.get("LLM_FAILOVER_ENABLED", "true").lower() == "true"
@@ -25,26 +28,37 @@ class LlmRouter:
         # Kota/bakiye gibi kalici hatalarda kisa devreyi cok uzun tut (default 1 saat)
         self.quota_cooldown_sec = int(os.environ.get("LLM_QUOTA_COOLDOWN_SEC", "3600"))
 
+        # DigitalOcean Gradient AI / Serverless Inference: OpenAI-uyumlu, tek key ile
+        # tum modellere erisim (https://inference.do-ai.run/v1).
+        self.do_base_url = os.environ.get(
+            "DIGITALOCEAN_BASE_URL", "https://inference.do-ai.run/v1"
+        ).rstrip("/")
+
         self.models = {
+            "digitalocean": os.environ.get("DIGITALOCEAN_MODEL", "openai-gpt-5-mini"),
             "groq": os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
             "together": os.environ.get("TOGETHER_MODEL", "meta-llama/Llama-3.3-70B-Instruct-Turbo"),
             "deepseek": os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
             "openai": os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
             "anthropic": os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
         }
-        # detailLevel -> provider:model
+        # detailLevel -> provider:model (production defaults: DigitalOcean)
+        # - brief    : GPT-5 Nano  ($0.05 / $0.40)  - hizli, ucuz, Turkce iyi
+        # - standard : GPT-5 Mini  ($0.25 / $2.00)  - fiyat/performans lideri
+        # - deep     : Claude Sonnet 4.6 ($3 / $15) - uzun finansal rapor / KAP analizi
         self.detail_routes = {
             "brief": self._parse_route(
-                os.environ.get("LLM_ROUTE_BRIEF", "together:Qwen/Qwen3.5-9B-Instruct")
+                os.environ.get("LLM_ROUTE_BRIEF", "digitalocean:openai-gpt-5-nano")
             ),
             "standard": self._parse_route(
-                os.environ.get("LLM_ROUTE_STANDARD", "together:gpt-oss-120b")
+                os.environ.get("LLM_ROUTE_STANDARD", "digitalocean:openai-gpt-5-mini")
             ),
             "deep": self._parse_route(
-                os.environ.get("LLM_ROUTE_DEEP", "groq:llama-3.3-70b-versatile")
+                os.environ.get("LLM_ROUTE_DEEP", "digitalocean:anthropic-claude-sonnet-4-6")
             ),
         }
         self.keys = {
+            "digitalocean": os.environ.get("DIGITALOCEAN_API_KEY") or os.environ.get("DO_API_KEY"),
             "groq": os.environ.get("GROQ_API_KEY"),
             "together": os.environ.get("TOGETHER_API_KEY"),
             "deepseek": os.environ.get("DEEPSEEK_API_KEY"),
@@ -145,7 +159,7 @@ class LlmRouter:
         if level not in ("brief", "standard", "deep"):
             level = "standard"
         provider, model = self.detail_routes.get(level, (None, None))
-        if provider and stream and provider not in ("groq", "together", "deepseek", "openai", "anthropic"):
+        if provider and stream and provider not in ("digitalocean", "groq", "together", "deepseek", "openai", "anthropic"):
             return None, None
         return provider, model
 
@@ -168,6 +182,10 @@ class LlmRouter:
             "top_p": top_p,
             "stream": False,
         }
+        # Anthropic/Claude on DO Gradient AI rejects temperature+top_p together; drop top_p.
+        _ml = (model or "").lower()
+        if "anthropic" in _ml or "claude" in _ml:
+            payload.pop("top_p", None)
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         resp = requests.post(url, headers=headers, json=payload, timeout=self.request_timeout)
         if resp.status_code >= 400:
@@ -352,6 +370,16 @@ class LlmRouter:
             raise RuntimeError(f"{provider}: api key missing")
         model = model_override or self.models.get(provider)
 
+        if provider == "digitalocean":
+            return self._openai_compatible_chat(
+                base_url=self.do_base_url,
+                api_key=key,
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+            )
         if provider == "groq":
             return self._openai_compatible_chat(
                 base_url="https://api.groq.com/openai/v1",
@@ -421,6 +449,10 @@ class LlmRouter:
             "top_p": top_p,
             "stream": True,
         }
+        # Anthropic/Claude on DO Gradient AI rejects temperature+top_p together; drop top_p.
+        _ml = (model or "").lower()
+        if "anthropic" in _ml or "claude" in _ml:
+            payload.pop("top_p", None)
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         with requests.post(
             url,
@@ -431,6 +463,8 @@ class LlmRouter:
         ) as resp:
             if resp.status_code >= 400:
                 raise RuntimeError(f"{url} -> {resp.status_code} {resp.text[:300]}")
+            # SSE icin charset header gelmediginde requests Latin-1 varsayar -> Turkce karakterler bozulur.
+            resp.encoding = "utf-8"
             for raw_line in resp.iter_lines(decode_unicode=True):
                 if not raw_line:
                     continue
@@ -491,6 +525,18 @@ class LlmRouter:
                             yield delta.content
                 except Exception:
                     continue
+            return
+
+        if provider == "digitalocean":
+            yield from self._stream_openai_compatible(
+                base_url=self.do_base_url,
+                api_key=key,
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+            )
             return
 
         if provider == "together":
@@ -619,10 +665,10 @@ class LlmRouter:
         preferred_provider: Optional[str] = None,
         preferred_model: Optional[str] = None,
     ):
-        """Streaming support (phase-2): Groq, Together, OpenAI."""
+        """Streaming support: DigitalOcean, Groq, Together, DeepSeek, OpenAI, Anthropic."""
         candidates = self._provider_candidates(preferred_provider)
         last_err: Optional[Exception] = None
-        stream_caps = ("groq", "together", "deepseek", "openai", "anthropic")
+        stream_caps = ("digitalocean", "groq", "together", "deepseek", "openai", "anthropic")
         enabled_stream = [
             p for p in candidates
             if p in stream_caps and self._is_enabled(p)
@@ -688,6 +734,7 @@ class LlmRouter:
             "enabled": enabled,
             "circuit_open": open_circuit,
             "streaming": {
+                "digitalocean": bool(self.keys.get("digitalocean")),
                 "groq": bool(self._groq_stream_client) and bool(self.keys.get("groq")),
                 "together": bool(self.keys.get("together")),
                 "deepseek": bool(self.keys.get("deepseek")),
