@@ -21,8 +21,16 @@ class LlmRouter:
             if p.strip()
         ]
         self.failover_enabled = os.environ.get("LLM_FAILOVER_ENABLED", "true").lower() == "true"
-        self.request_timeout = float(os.environ.get("LLM_REQUEST_TIMEOUT", "30"))
-        self.max_retries = int(os.environ.get("LLM_MAX_RETRIES", "1"))
+        # Geriye uyumluluk: LLM_REQUEST_TIMEOUT eski tek-degerli ayar (varsayilan 60s read).
+        # Yeni ayri ayarlar: LLM_CONNECT_TIMEOUT (default 5s), LLM_READ_TIMEOUT (default 60s).
+        # requests.post(..., timeout=(connect, read)) tuple olarak gecirilir; cold start'ta
+        # bagli kalinmaz, generation icin daha rahat zaman tanir.
+        _legacy_timeout = float(os.environ.get("LLM_REQUEST_TIMEOUT", "60"))
+        self.connect_timeout = float(os.environ.get("LLM_CONNECT_TIMEOUT", "5"))
+        self.read_timeout = float(os.environ.get("LLM_READ_TIMEOUT", str(_legacy_timeout)))
+        # Tuple (connect, read) — requests/urllib3 destekler.
+        self.request_timeout: Any = (self.connect_timeout, self.read_timeout)
+        self.max_retries = int(os.environ.get("LLM_MAX_RETRIES", "2"))
         self.circuit_fails = int(os.environ.get("LLM_CIRCUIT_FAILS", "3"))
         self.circuit_cooldown_sec = int(os.environ.get("LLM_CIRCUIT_COOLDOWN_SEC", "60"))
         # Kota/bakiye gibi kalici hatalarda kisa devreyi cok uzun tut (default 1 saat)
@@ -78,7 +86,7 @@ class LlmRouter:
             from groq import Groq  # type: ignore
             self._groq_stream_client = Groq(
                 api_key=key,
-                timeout=self.request_timeout,
+                timeout=self.read_timeout,
                 max_retries=self.max_retries,
             )
         except Exception:
@@ -222,6 +230,230 @@ class LlmRouter:
             "model": data.get("model") or model,
             "tokens": usage.get("total_tokens"),
         }
+
+    # ========================================================================
+    # TOOL CALLING (OpenAI-compatible function calling)
+    # ========================================================================
+
+    _TOOL_BASE_URLS = {
+        # digitalocean / openai default; digitalocean'a self.do_base_url ile override
+        "openai": "https://api.openai.com/v1",
+        "together": "https://api.together.xyz/v1",
+        "deepseek": "https://api.deepseek.com/v1",
+    }
+
+    # ========================================================================
+    # VISION (multimodal image input)
+    # ========================================================================
+    # Bu provider'lar OpenAI-format `image_url` content part'ini destekler.
+    # Diger provider'lara (groq llama text-only vb.) failover olursa resim
+    # icerikleri otomatik olarak text placeholder'a indirilir.
+    _VISION_CAPABLE_PROVIDERS = {"digitalocean", "openai"}
+
+    @classmethod
+    def is_vision_capable(cls, provider: str) -> bool:
+        return (provider or "").strip().lower() in cls._VISION_CAPABLE_PROVIDERS
+
+    @staticmethod
+    def _strip_images_from_messages(messages: List[dict]) -> List[dict]:
+        """Multimodal content array'lerini duz text'e indirir. Resim URL'leri
+        '[gorsel: ...]' placeholder olarak text icine eklenir ki model en azindan
+        kullanicinin gorsel ekledigini bilsin."""
+        out: List[dict] = []
+        for m in messages or []:
+            content = m.get("content")
+            if isinstance(content, list):
+                text_parts: List[str] = []
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    ptype = part.get("type")
+                    if ptype == "text":
+                        t = part.get("text") or ""
+                        if t:
+                            text_parts.append(t)
+                    elif ptype == "image_url":
+                        url_obj = part.get("image_url") or {}
+                        url = (
+                            url_obj.get("url")
+                            if isinstance(url_obj, dict)
+                            else str(url_obj)
+                        ) or ""
+                        # base64 data URL'lerini placeholder'a indir (cok uzun)
+                        if url.startswith("data:"):
+                            text_parts.append("[gorsel: (eklenmis base64 resim)]")
+                        elif url:
+                            text_parts.append(f"[gorsel: {url}]")
+                new_msg = dict(m)
+                new_msg["content"] = "\n".join(text_parts)
+                out.append(new_msg)
+            else:
+                out.append(m)
+        return out
+
+    def _prepare_messages_for_provider(
+        self, messages: List[dict], provider: str
+    ) -> List[dict]:
+        """Provider vision-capable degilse multimodal content'i strip eder."""
+        if self.is_vision_capable(provider):
+            return messages
+        # Hizli kontrol: hic list-content yoksa kopya bile alma
+        has_multimodal = any(isinstance(m.get("content"), list) for m in (messages or []))
+        if not has_multimodal:
+            return messages
+        return self._strip_images_from_messages(messages)
+
+    def _chat_with_tools_once(
+        self,
+        messages: List[dict],
+        tools: Optional[List[dict]],
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        provider: str,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Tek seferlik tool-aware OpenAI-uyumlu chat. Tool loop tools.py'da."""
+        p = (provider or "").strip().lower()
+        key = self.keys.get(p)
+        if not key:
+            raise RuntimeError(f"{p}: api key missing")
+        mdl = model or self.models.get(p)
+        # Vision: tool-capable provider'lar zaten vision-capable; yine de strip
+        # cagrisi idempotent (multimodal yoksa orijinali doner).
+        messages = self._prepare_messages_for_provider(messages, p)
+        if p == "digitalocean":
+            base = self.do_base_url
+        else:
+            base = self._TOOL_BASE_URLS.get(p)
+            if not base:
+                raise RuntimeError(f"tool calling unsupported for provider '{p}'")
+
+        url = f"{base.rstrip('/')}/chat/completions"
+        payload: Dict[str, Any] = {
+            "model": mdl,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "stream": False,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["parallel_tool_calls"] = True
+            payload["tool_choice"] = "auto"
+        _ml = (mdl or "").lower()
+        if "anthropic" in _ml or "claude" in _ml:
+            # Claude on DO Gradient AI: top_p + temperature ikisi birden gonderilmez.
+            payload.pop("top_p", None)
+
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        resp = requests.post(url, headers=headers, json=payload, timeout=self.request_timeout)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"{url} -> {resp.status_code} {resp.text[:400]}")
+        data = resp.json()
+        choice0 = (data.get("choices") or [{}])[0]
+        msg = choice0.get("message") or {}
+        usage = data.get("usage") or {}
+        return {
+            "message": msg,
+            "finish_reason": choice0.get("finish_reason"),
+            "model": data.get("model") or mdl,
+            "provider": p,
+            "tokens": usage.get("total_tokens"),
+        }
+
+    def chat_with_tools(
+        self,
+        messages: List[dict],
+        max_tokens: int,
+        temperature: float = 0.4,
+        top_p: float = 0.85,
+        preferred_provider: Optional[str] = None,
+        preferred_model: Optional[str] = None,
+        tools: Optional[List[dict]] = None,
+        max_iters: int = 3,
+    ) -> Dict[str, Any]:
+        """Tool-aware chat. Tool-capable olmayan provider'larda fallback chain'i
+        normal _call_provider'a duser (tool'suz)."""
+        # Lazy import to avoid circular dependency
+        from . import tools as _tools_mod
+
+        candidates = self._provider_candidates(preferred_provider)
+        attempts: List[str] = []
+        last_err: Optional[Exception] = None
+        t0_total = time.time()
+
+        # Once tool-capable provider'lari dene
+        for provider in candidates:
+            if not self._is_enabled(provider):
+                continue
+            if self._is_circuit_open(provider):
+                continue
+            if not _tools_mod.is_tool_capable(provider):
+                continue
+            attempts.append(provider)
+            t0 = time.time()
+            try:
+                out = _tools_mod.run_tool_loop(
+                    router=self,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    preferred_provider=provider,
+                    preferred_model=(
+                        preferred_model
+                        if provider == (preferred_provider or "").strip().lower()
+                        else None
+                    ),
+                    max_iters=max_iters,
+                    tools=tools,
+                )
+                if not (out.get("text") or "").strip():
+                    raise RuntimeError("tool loop returned empty text")
+                self._record_success(provider)
+                out["attempts"] = attempts
+                out["latency_ms"] = int((time.time() - t0_total) * 1000)
+                out["mode"] = "tools"
+                return out
+            except Exception as e:
+                last_err = e
+                if self._is_quota_error(e):
+                    print(
+                        f"[llm_router] chat_with_tools() {provider} quota exhausted",
+                        flush=True,
+                    )
+                    self._record_quota_exhausted(provider)
+                else:
+                    print(
+                        f"[llm_router] chat_with_tools() {provider} failed in "
+                        f"{int((time.time()-t0)*1000)}ms: {type(e).__name__}: {e}",
+                        flush=True,
+                    )
+                    self._record_failure(provider)
+                if not self.failover_enabled:
+                    break
+
+        # Tool-capable hepsi cokmusse: normal chat()'e geri don (tool'suz fallback)
+        print(
+            f"[llm_router] chat_with_tools(): tool-capable provider'lar yetersiz, "
+            f"normal chat()'e fallback. attempts={attempts}",
+            flush=True,
+        )
+        out = self.chat(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            preferred_provider=preferred_provider,
+            preferred_model=preferred_model,
+        )
+        out["mode"] = "fallback_no_tools"
+        out["tool_attempts"] = attempts
+        if last_err is not None:
+            out["tool_error"] = str(last_err)
+        return out
 
     def _anthropic_chat(
         self,
@@ -369,6 +601,9 @@ class LlmRouter:
         if not key:
             raise RuntimeError(f"{provider}: api key missing")
         model = model_override or self.models.get(provider)
+        # Vision: provider destekliyorsa multimodal content gecer; degilse
+        # resimler text placeholder'a indirilir (Llama gibi text-only fallback'lerde).
+        messages = self._prepare_messages_for_provider(messages, provider)
 
         if provider == "digitalocean":
             return self._openai_compatible_chat(
@@ -503,6 +738,7 @@ class LlmRouter:
         if not key:
             raise RuntimeError(f"{provider}: api key missing")
         model = model_override or self.models.get(provider)
+        messages = self._prepare_messages_for_provider(messages, provider)
 
         if provider == "groq":
             # Groq SDK stream -> normalize to text chunks
@@ -594,6 +830,27 @@ class LlmRouter:
             return [preferred] + rest
         return list(self.provider_order)
 
+    @staticmethod
+    def _messages_have_images(messages: List[dict]) -> bool:
+        for m in messages or []:
+            c = m.get("content")
+            if isinstance(c, list):
+                for part in c:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        return True
+        return False
+
+    def _reorder_for_vision(
+        self, candidates: List[str], messages: List[dict]
+    ) -> List[str]:
+        """Mesajlarda resim varsa vision-capable provider'lari one al.
+        Boylece resimler text-only Llama fallback'inde kaybolmaz."""
+        if not self._messages_have_images(messages):
+            return candidates
+        vision = [p for p in candidates if self.is_vision_capable(p)]
+        non_vision = [p for p in candidates if not self.is_vision_capable(p)]
+        return vision + non_vision
+
     def chat(
         self,
         messages: List[dict],
@@ -604,6 +861,8 @@ class LlmRouter:
         preferred_model: Optional[str] = None,
     ) -> Dict[str, Any]:
         candidates = self._provider_candidates(preferred_provider)
+        # Resim varsa vision-capable provider'lari one cikar.
+        candidates = self._reorder_for_vision(candidates, messages)
         attempts: List[str] = []
         last_err: Optional[Exception] = None
 
@@ -667,6 +926,7 @@ class LlmRouter:
     ):
         """Streaming support: DigitalOcean, Groq, Together, DeepSeek, OpenAI, Anthropic."""
         candidates = self._provider_candidates(preferred_provider)
+        candidates = self._reorder_for_vision(candidates, messages)
         last_err: Optional[Exception] = None
         stream_caps = ("digitalocean", "groq", "together", "deepseek", "openai", "anthropic")
         enabled_stream = [

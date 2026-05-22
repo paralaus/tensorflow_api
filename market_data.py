@@ -16,6 +16,7 @@ olarak enjekte edilecek kısa bir metin hazırlamaktır.
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -23,6 +24,53 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
+
+# --- MongoDB (backend Atlas) lazy client ---
+# Backend cron job'lari Market collection'ina goldPrice + silverPrice + emtia
+# verilerini yaziyor. Burada CollectAPI'ye direkt vurmak yerine ayni Mongo'dan
+# okuyoruz; quota harcamiyor, network'te 1 sorgu.
+try:
+    from pymongo import MongoClient  # type: ignore
+    _HAS_PYMONGO = True
+except Exception as _e:
+    MongoClient = None  # type: ignore
+    _HAS_PYMONGO = False
+    print(f"[market_data] pymongo yok, Mongo commodity fetcher devre disi: {_e}")
+
+_mongo_client = None
+_mongo_lock = threading.Lock()
+
+
+def _get_mongo_markets():
+    """Lazy, thread-safe singleton: backend Mongo Atlas 'markets' collection.
+    MONGODB_URL env yoksa veya pymongo kurulu degilse None doner."""
+    global _mongo_client
+    if not _HAS_PYMONGO:
+        return None
+    uri = os.environ.get("MONGODB_URL") or os.environ.get("MONGO_URL")
+    if not uri:
+        return None
+    with _mongo_lock:
+        if _mongo_client is None:
+            try:
+                _mongo_client = MongoClient(
+                    uri,
+                    serverSelectionTimeoutMS=2000,
+                    connectTimeoutMS=2000,
+                    socketTimeoutMS=3000,
+                    appname="hissechat-rag",
+                )
+            except Exception as e:
+                print(f"[market_data] Mongo baglanti hatasi: {e}")
+                return None
+    try:
+        db = _mongo_client.get_default_database()
+        if db is None:
+            db = _mongo_client["borsa"]
+        return db["markets"]
+    except Exception as e:
+        print(f"[market_data] Mongo db erisim hatasi: {e}")
+        return None
 
 # --- HTTP session (keep-alive). requests yoksa urllib fallback ---
 try:
@@ -143,6 +191,31 @@ CRYPTO_MAP = {
 # Döviz kodları (kullanıcı sorusundan TRY karşılığı çekilecek)
 FX_CODES = {"usd", "eur", "gbp", "chf", "jpy", "cad", "aud", "rub", "cny", "sar", "aed"}
 
+# Emtia / altin aliaslari -> backend Market.code (Atlas'taki kayit kodu)
+# Backend goldPrice (slugify TR isim), silverPrice ('GUMUS'), emtia (CodeMap) yaziyor.
+COMMODITY_ALIASES = {
+    # TR altin turleri
+    "gram altin": "GRAM_ALTIN", "gram altın": "GRAM_ALTIN",
+    "ceyrek altin": "CEYREK_ALTIN", "çeyrek altın": "CEYREK_ALTIN", "ceyrek": "CEYREK_ALTIN", "çeyrek": "CEYREK_ALTIN",
+    "yarim altin": "YARIM_ALTIN", "yarım altın": "YARIM_ALTIN", "yarim": "YARIM_ALTIN", "yarım": "YARIM_ALTIN",
+    "tam altin": "TAM_ALTIN", "tam altın": "TAM_ALTIN",
+    "cumhuriyet altini": "CUMHURIYET_ALTINI", "cumhuriyet altını": "CUMHURIYET_ALTINI", "cumhuriyet": "CUMHURIYET_ALTINI",
+    "ata altin": "ATA_ALTIN", "ata altın": "ATA_ALTIN",
+    "resat altin": "RESAT_ALTIN", "reşat altın": "RESAT_ALTIN", "resat": "RESAT_ALTIN", "reşat": "RESAT_ALTIN",
+    "hamit altin": "HAMIT_ALTIN", "hamit altın": "HAMIT_ALTIN",
+    # USD spot altin / gumus
+    "ons altin": "ONS", "ons altın": "ONS", "ons": "ONS", "spot altin": "ONS", "spot altın": "ONS",
+    "xau": "ONS", "xauusd": "ONS",
+    "gumus": "GUMUS", "gümüş": "GUMUS", "silver": "GUMUS",
+    "xag": "XAGUSD", "xagusd": "XAGUSD",
+    # Petrol
+    "brent": "BRENT", "petrol": "BRENT", "varil": "BRENT",
+    "wti": "WTI",
+    # Platin / paladyum
+    "platin": "PLATIN",
+    "paladyum": "PALADYUM", "palladium": "PALADYUM",
+}
+
 
 # ============== ENTITY TESPİTİ ==============
 
@@ -153,7 +226,7 @@ def _norm(s: str) -> str:
 def detect_entities(question: str) -> dict:
     """Soru metninden BIST/kripto/döviz varlıkları tespit et."""
     q = _norm(question)
-    found = {"bist": set(), "crypto": set(), "fx": set(), "index": set()}
+    found = {"bist": set(), "crypto": set(), "fx": set(), "index": set(), "commodity": set()}
 
     # BIST endeksleri
     for alias, code in BIST_INDEX_ALIASES.items():
@@ -190,6 +263,15 @@ def detect_entities(question: str) -> dict:
     # Genel "kripto" sorusu
     if any(w in q for w in ["kripto", "coin", "altcoin"]) and not found["crypto"]:
         found["crypto"].update({"bitcoin", "ethereum"})
+
+    # Emtia / altin (en uzun alias once eslesir diye sirali)
+    for alias in sorted(COMMODITY_ALIASES.keys(), key=len, reverse=True):
+        if re.search(rf"\b{re.escape(alias)}\b", q):
+            found["commodity"].add(COMMODITY_ALIASES[alias])
+
+    # Generic "altin" / "altın" -> gram + ons + ceyrek default
+    if re.search(r"\baltin\b|\baltın\b", q) and not found["commodity"]:
+        found["commodity"].update({"GRAM_ALTIN", "ONS", "CEYREK_ALTIN"})
 
     return {k: sorted(v) for k, v in found.items()}
 
@@ -307,6 +389,43 @@ def fetch_bist(tickers: list[str]) -> list[dict]:
     return out
 
 
+def fetch_commodity_local(codes: list[str]) -> list[dict]:
+    """Backend MongoDB Atlas 'markets' collection'indan emtia/altin verisi oku.
+    Backend cron'lari (goldPrice, silverPrice, emtia) bu kayitlari guncel tutuyor.
+    CollectAPI'ye direkt vurmaktan iyi: quota 0, latency ~Atlas RTT."""
+    if not codes:
+        return []
+    key = "commodity:" + ",".join(sorted(codes))
+    cached = _cache_get(key, ttl=300)  # 5 dk — backend zaten saatlik update
+    if cached is not None:
+        return cached
+
+    coll = _get_mongo_markets()
+    if coll is None:
+        return []
+    out: list[dict] = []
+    try:
+        cursor = coll.find(
+            {"code": {"$in": codes}},
+            {"code": 1, "name": 1, "price": 1, "rate": 1, "currency": 1, "_id": 0},
+        )
+        for doc in cursor:
+            if doc.get("price") is None:
+                continue
+            out.append({
+                "code": doc.get("code"),
+                "name": doc.get("name") or doc.get("code"),
+                "price": doc.get("price"),
+                "rate": doc.get("rate"),
+                "currency": (doc.get("currency") or "TRY").upper(),
+            })
+    except Exception as e:
+        print(f"[market_data] Mongo commodity sorgu hatasi: {e}")
+        return []
+    _cache_set(key, out)
+    return out
+
+
 def fetch_index(codes: list[str]) -> list[dict]:
     if not codes:
         return []
@@ -368,6 +487,8 @@ def build_market_context(question: str) -> str | None:
         futures["crypto"] = _md_executor.submit(fetch_crypto, ents["crypto"])
     if ents["fx"]:
         futures["fx"] = _md_executor.submit(fetch_fx, ents["fx"])
+    if ents.get("commodity"):
+        futures["commodity"] = _md_executor.submit(fetch_commodity_local, ents["commodity"])
 
     results: dict[str, list[dict]] = {}
     for name, fut in futures.items():
@@ -408,6 +529,17 @@ def build_market_context(question: str) -> str | None:
     # Döviz
     for row in results.get("fx", []):
         lines.append(f"- 1 {row['code']} = {_fmt_num(row['try'], 4)} TL")
+
+    # Emtia / Altin (Backend Mongo Atlas)
+    for row in results.get("commodity", []):
+        cur = row.get("currency") or "TRY"
+        unit = "TL" if cur == "TRY" else cur
+        rate = row.get("rate")
+        rate_part = f" ({_fmt_pct(rate)})" if rate not in (None, 0) else ""
+        lines.append(
+            f"- {row['name']} [{row['code']}]: "
+            f"{_fmt_num(row['price'], 2)} {unit}{rate_part}"
+        )
 
     if not lines:
         return None

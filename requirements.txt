@@ -12,6 +12,10 @@ redis>=5.0.0
 # HTTP client (market_data icin keep-alive + gzip; yoksa urllib fallback)
 requests>=2.31.0
 
+# MongoDB driver (RAG commodity fetcher backend Atlas'tan okumak icin)
+# Yoksa fetch_commodity_local sessizce devre disi kalir.
+pymongo>=4.6.0
+
 # Rate limiting (REDIS_URL varsa redis, yoksa memory storage)
 flask-limiter>=3.5.0
 
