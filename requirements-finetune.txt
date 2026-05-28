@@ -1,0 +1,10 @@
+torch>=2.2.0
+transformers>=4.41.0
+datasets>=2.19.0
+peft>=0.11.0
+accelerate>=0.30.0
+trl>=0.9.4
+bitsandbytes>=0.43.1; platform_system != "Windows"
+sentencepiece>=0.2.0
+scipy>=1.11.0
+scikit-learn>=1.4.0

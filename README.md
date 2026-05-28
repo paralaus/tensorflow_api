@@ -1,5 +1,18 @@
 # paralaus-project
 
+## Custom Model Training
+
+Kendi verinizle LoRA egitimi ve local model entegrasyonu icin:
+
+- Dokuman: `docs/CUSTOM_MODEL_TRAINING.md`
+- Mongo export: `scripts/export_training_data.py`
+- Dataset hazirlama: `scripts/prepare_finetune_dataset.py`
+- Egitim: `scripts/train_lora.py`
+- Tek komut pipeline: `scripts/run_finetune_pipeline.py`
+- Cron runner: `scripts/run_finetune_cron.sh`
+- Cron installer: `scripts/install_finetune_cron.sh`
+- Ek bagimliliklar: `requirements-finetune.txt`
+
 
 
 ## Getting started

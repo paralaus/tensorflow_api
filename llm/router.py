@@ -16,7 +16,7 @@ class LlmRouter:
             p.strip().lower()
             for p in os.environ.get(
                 "LLM_PROVIDER_ORDER",
-                "digitalocean,groq,together,deepseek,openai,anthropic",
+                "digitalocean,groq,together,deepseek,openai,anthropic,local",
             ).split(",")
             if p.strip()
         ]
@@ -41,6 +41,8 @@ class LlmRouter:
         self.do_base_url = os.environ.get(
             "DIGITALOCEAN_BASE_URL", "https://inference.do-ai.run/v1"
         ).rstrip("/")
+        self.local_enabled = os.environ.get("LOCAL_LLM_ENABLED", "false").lower() == "true"
+        self.local_base_url = os.environ.get("LOCAL_LLM_BASE_URL", "http://127.0.0.1:8001/v1").rstrip("/")
 
         self.models = {
             "digitalocean": os.environ.get("DIGITALOCEAN_MODEL", "openai-gpt-5-mini"),
@@ -49,6 +51,7 @@ class LlmRouter:
             "deepseek": os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
             "openai": os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
             "anthropic": os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
+            "local": os.environ.get("LOCAL_LLM_MODEL", "hissechat-local"),
         }
         # detailLevel -> provider:model (production defaults: DigitalOcean)
         # - brief    : GPT-5 Nano  ($0.05 / $0.40)  - hizli, ucuz, Turkce iyi
@@ -72,6 +75,11 @@ class LlmRouter:
             "deepseek": os.environ.get("DEEPSEEK_API_KEY"),
             "openai": os.environ.get("OPENAI_API_KEY"),
             "anthropic": os.environ.get("ANTHROPIC_API_KEY"),
+            "local": (
+                os.environ.get("LOCAL_LLM_API_KEY")
+                if self.local_enabled
+                else None
+            ),
         }
 
         self._circuit: Dict[str, Dict[str, float]] = {}
@@ -93,6 +101,8 @@ class LlmRouter:
             self._groq_stream_client = None
 
     def _is_enabled(self, provider: str) -> bool:
+        if provider == "local":
+            return bool(self.local_enabled and self.local_base_url)
         return bool(self.keys.get(provider))
 
     def _is_circuit_open(self, provider: str) -> bool:
@@ -167,7 +177,7 @@ class LlmRouter:
         if level not in ("brief", "standard", "deep"):
             level = "standard"
         provider, model = self.detail_routes.get(level, (None, None))
-        if provider and stream and provider not in ("digitalocean", "groq", "together", "deepseek", "openai", "anthropic"):
+        if provider and stream and provider not in ("digitalocean", "groq", "together", "deepseek", "openai", "anthropic", "local"):
             return None, None
         return provider, model
 
@@ -240,6 +250,7 @@ class LlmRouter:
         "openai": "https://api.openai.com/v1",
         "together": "https://api.together.xyz/v1",
         "deepseek": "https://api.deepseek.com/v1",
+        "local": None,
     }
 
     # ========================================================================
@@ -598,7 +609,7 @@ class LlmRouter:
         model_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         key = self.keys.get(provider)
-        if not key:
+        if provider != "local" and not key:
             raise RuntimeError(f"{provider}: api key missing")
         model = model_override or self.models.get(provider)
         # Vision: provider destekliyorsa multimodal content gecer; degilse
@@ -649,6 +660,16 @@ class LlmRouter:
             return self._openai_compatible_chat(
                 base_url="https://api.openai.com/v1",
                 api_key=key,
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+            )
+        if provider == "local":
+            return self._openai_compatible_chat(
+                base_url=self.local_base_url,
+                api_key=key or "local-dev-key",
                 model=model,
                 messages=messages,
                 max_tokens=max_tokens,
@@ -735,7 +756,7 @@ class LlmRouter:
         model_override: Optional[str] = None,
     ) -> Iterator[str]:
         key = self.keys.get(provider)
-        if not key:
+        if provider != "local" and not key:
             raise RuntimeError(f"{provider}: api key missing")
         model = model_override or self.models.get(provider)
         messages = self._prepare_messages_for_provider(messages, provider)
@@ -803,6 +824,18 @@ class LlmRouter:
             yield from self._stream_openai_compatible(
                 base_url="https://api.openai.com/v1",
                 api_key=key,
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+            )
+            return
+
+        if provider == "local":
+            yield from self._stream_openai_compatible(
+                base_url=self.local_base_url,
+                api_key=key or "local-dev-key",
                 model=model,
                 messages=messages,
                 max_tokens=max_tokens,
@@ -924,11 +957,11 @@ class LlmRouter:
         preferred_provider: Optional[str] = None,
         preferred_model: Optional[str] = None,
     ):
-        """Streaming support: DigitalOcean, Groq, Together, DeepSeek, OpenAI, Anthropic."""
+        """Streaming support: DigitalOcean, Groq, Together, DeepSeek, OpenAI, Anthropic, Local."""
         candidates = self._provider_candidates(preferred_provider)
         candidates = self._reorder_for_vision(candidates, messages)
         last_err: Optional[Exception] = None
-        stream_caps = ("digitalocean", "groq", "together", "deepseek", "openai", "anthropic")
+        stream_caps = ("digitalocean", "groq", "together", "deepseek", "openai", "anthropic", "local")
         enabled_stream = [
             p for p in candidates
             if p in stream_caps and self._is_enabled(p)
@@ -1000,6 +1033,7 @@ class LlmRouter:
                 "deepseek": bool(self.keys.get("deepseek")),
                 "openai": bool(self.keys.get("openai")),
                 "anthropic": bool(self.keys.get("anthropic")),
+                "local": bool(self.local_enabled and self.local_base_url),
             },
             "models": self.models,
             "detail_routes": self.detail_routes,
