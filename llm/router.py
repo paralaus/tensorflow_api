@@ -351,7 +351,10 @@ class LlmRouter:
         }
         if tools:
             payload["tools"] = tools
-            payload["parallel_tool_calls"] = True
+            # parallel_tool_calls OpenAI/Groq destekler; DigitalOcean Gradient
+            # AI 400 "Extra inputs are not permitted" donuyor — atla.
+            if p != "digitalocean":
+                payload["parallel_tool_calls"] = True
             payload["tool_choice"] = "auto"
         _ml = (mdl or "").lower()
         if "anthropic" in _ml or "claude" in _ml:

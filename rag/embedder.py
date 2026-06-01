@@ -40,8 +40,18 @@ HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 
 # DigitalOcean Serverless Inference endpoint (OpenAI-uyumlu)
 DO_BASE_URL = os.environ.get("DIGITALOCEAN_BASE_URL", "https://inference.do-ai.run/v1").rstrip("/")
-DO_TIMEOUT = float(os.environ.get("RAG_EMBED_TIMEOUT", "30"))
+# DO inference zaman zaman cok yavas; dis RAG_QUERY_TIMEOUT (default 3s) ile
+# uyumlu olmasi icin query timeout'u kisa, ingest icin ayri (uzun) tutuyoruz.
+DO_QUERY_TIMEOUT = float(os.environ.get("RAG_EMBED_QUERY_TIMEOUT", "2.5"))
+DO_INGEST_TIMEOUT = float(os.environ.get("RAG_EMBED_TIMEOUT", "30"))
+DO_CONNECT_TIMEOUT = float(os.environ.get("RAG_EMBED_CONNECT_TIMEOUT", "1.5"))
 DO_BATCH_LIMIT = int(os.environ.get("RAG_EMBED_BATCH", "64"))
+
+# Ardisik hatalardan sonra kisa devre kes (her istekte yine timeout yememek icin)
+_FAIL_THRESHOLD = int(os.environ.get("RAG_EMBED_FAIL_THRESHOLD", "3"))
+_COOLDOWN_SEC = float(os.environ.get("RAG_EMBED_COOLDOWN_SEC", "30"))
+_fail_count = 0
+_cooldown_until = 0.0
 
 _model = None
 _dim: Optional[int] = None
@@ -101,7 +111,7 @@ def _ensure_loaded():
             _DISABLED = True
 
 
-def _do_embed_request(texts: list[str]) -> list[list[float]]:
+def _do_embed_request(texts: list[str], timeout: Optional[float] = None) -> list[list[float]]:
     """DigitalOcean OpenAI-uyumlu /v1/embeddings cagrisi. Hata -> exception."""
     if not texts:
         return []
@@ -110,11 +120,12 @@ def _do_embed_request(texts: list[str]) -> list[list[float]]:
         "Authorization": f"Bearer {_DO_KEY}",
         "Content-Type": "application/json",
     }
+    read_to = timeout if timeout is not None else DO_INGEST_TIMEOUT
     resp = requests.post(
         f"{DO_BASE_URL}/embeddings",
         headers=headers,
         json=payload,
-        timeout=DO_TIMEOUT,
+        timeout=(DO_CONNECT_TIMEOUT, read_to),
     )
     if resp.status_code >= 400:
         raise RuntimeError(f"DO embeddings -> {resp.status_code} {resp.text[:200]}")
@@ -155,14 +166,22 @@ def dimension() -> Optional[int]:
 
 def embed_query(text: str) -> Optional[list[float]]:
     """Tek sorgu icin embedding. Hata/disabled -> None."""
+    global _fail_count, _cooldown_until
     if not text or not text.strip():
         return None
     _ensure_loaded()
     if _DISABLED or _model is None:
         return None
+    # Circuit breaker: ardisik timeout sonrasi kisa sure atla
+    if PROVIDER == "digitalocean":
+        import time as _time
+        if _cooldown_until and _time.time() < _cooldown_until:
+            return None
     try:
         if PROVIDER == "digitalocean":
-            out = _do_embed_request([text])
+            out = _do_embed_request([text], timeout=DO_QUERY_TIMEOUT)
+            _fail_count = 0
+            _cooldown_until = 0.0
             return out[0] if out else None
         vec = _model.encode(
             text,
@@ -173,6 +192,16 @@ def embed_query(text: str) -> Optional[list[float]]:
         return vec.tolist()
     except Exception as e:
         print(f"[rag/embedder] embed_query hata: {e}")
+        if PROVIDER == "digitalocean":
+            import time as _time
+            _fail_count += 1
+            if _fail_count >= _FAIL_THRESHOLD:
+                _cooldown_until = _time.time() + _COOLDOWN_SEC
+                print(
+                    f"[rag/embedder] {_fail_count} ardisik hata, "
+                    f"{_COOLDOWN_SEC:.0f}s cooldown."
+                )
+                _fail_count = 0
         return None
 
 
