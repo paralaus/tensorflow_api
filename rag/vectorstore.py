@@ -130,6 +130,13 @@ def query(
     col = _get_collection(collection)
     if col is None or not embedding:
         return []
+    # Bos koleksiyonu sessizce atla: Chroma query'i HNSW segment dosyasi yoksa
+    # "Nothing found on disk" firlatir, her istekte log spam'i olusur.
+    try:
+        if col.count() == 0:
+            return []
+    except Exception:
+        pass
     try:
         kwargs = {
             "query_embeddings": [embedding],
