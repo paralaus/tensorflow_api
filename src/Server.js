@@ -46,6 +46,7 @@ const ngrok = require('ngrok');
 const jwt = require('jsonwebtoken');
 const fs = require('fs');
 const dgram = require('dgram');
+const nodeCrypto = require('crypto');
 const config = require('./config');
 const checkXSS = require('./XSS.js');
 const Host = require('./Host');
@@ -996,6 +997,103 @@ function runFfmpegHls(inputPath, outputDir, segmentDurationSeconds = 6) {
   });
 }
 
+const HLS_ASYNC_JOB_TTL_MS = (() => {
+  const n = parseInt(process.env.HLS_ASYNC_JOB_TTL_MS, 10);
+  return Number.isFinite(n) ? n : 60 * 60 * 1000;
+})();
+const HLS_ASYNC_JOB_MAX_KEEP = (() => {
+  const n = parseInt(process.env.HLS_ASYNC_JOB_MAX_KEEP, 10);
+  return Number.isFinite(n) ? n : 200;
+})();
+const hlsAsyncJobs = new Map();
+
+function pruneHlsJobs() {
+  const now = Date.now();
+  for (const [id, job] of hlsAsyncJobs.entries()) {
+    if (job && job.createdAt && now - job.createdAt > HLS_ASYNC_JOB_TTL_MS) {
+      hlsAsyncJobs.delete(id);
+    }
+  }
+  const extra = hlsAsyncJobs.size - HLS_ASYNC_JOB_MAX_KEEP;
+  if (extra > 0) {
+    const ids = Array.from(hlsAsyncJobs.keys());
+    for (let i = 0; i < extra; i++) {
+      hlsAsyncJobs.delete(ids[i]);
+    }
+  }
+}
+
+async function convertUrlToHls({ url, channelId, messageId }) {
+  const workDir = await createTempDirectory('hissechat-hls');
+  const sourcePath = path.join(workDir, 'source.mp4');
+
+  await downloadFile(url, sourcePath);
+
+  const hlsDir = path.join(workDir, 'hls');
+  await ensureDirectory(hlsDir);
+
+  const { durationSeconds } = await runFfmpegHls(sourcePath, hlsDir, 6);
+
+  const baseKey =
+    channelId && messageId
+      ? `hls/channel/${channelId}/${messageId}`
+      : `hls/misc/${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  let playlistUrl = null;
+
+  try {
+    playlistUrl = await uploadHlsDirectoryToSpaces(hlsDir, baseKey);
+  } finally {
+    try {
+      await fs.promises.rm(workDir, { recursive: true, force: true });
+    } catch (cleanupError) {
+      console.error('HLS temp cleanup error', cleanupError);
+    }
+  }
+
+  if (!playlistUrl) {
+    const err = new Error('hls_upload_failed');
+    err.code = 'hls_upload_failed';
+    throw err;
+  }
+
+  return {
+    playlistUrl,
+    durationSeconds,
+  };
+}
+
+function startAsyncHlsJob({ url, channelId, messageId }) {
+  pruneHlsJobs();
+  const jobId =
+    typeof nodeCrypto.randomUUID === 'function'
+      ? nodeCrypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+  hlsAsyncJobs.set(jobId, { status: 'queued', createdAt: Date.now() });
+
+  setImmediate(async () => {
+    const job = hlsAsyncJobs.get(jobId);
+    if (!job) return;
+    job.status = 'processing';
+    job.startedAt = Date.now();
+    try {
+      const result = await convertUrlToHls({ url, channelId, messageId });
+      job.status = 'done';
+      job.result = result;
+      job.finishedAt = Date.now();
+    } catch (e) {
+      job.status = 'failed';
+      job.error = (e && e.message) || 'hls_conversion_failed';
+      job.finishedAt = Date.now();
+    }
+    hlsAsyncJobs.set(jobId, job);
+    pruneHlsJobs();
+  });
+
+  return jobId;
+}
+
 
 
 const options = {
@@ -1267,45 +1365,34 @@ function startServer() {
       }
 
       try {
-        const workDir = await createTempDirectory('hissechat-hls');
-        const sourcePath = path.join(workDir, 'source.mp4');
+        const asyncMode =
+          String(req.query.async || '').trim() === '1' ||
+          String(req.query.async || '').trim().toLowerCase() === 'true';
 
-        await downloadFile(url, sourcePath);
-
-        const hlsDir = path.join(workDir, 'hls');
-        await ensureDirectory(hlsDir);
-
-        const { durationSeconds } = await runFfmpegHls(sourcePath, hlsDir, 6);
-
-        const baseKey =
-          channelId && messageId
-            ? `hls/channel/${channelId}/${messageId}`
-            : `hls/misc/${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-        let playlistUrl = null;
-
-        try {
-          playlistUrl = await uploadHlsDirectoryToSpaces(hlsDir, baseKey);
-        } finally {
-          try {
-            await fs.promises.rm(workDir, { recursive: true, force: true });
-          } catch (cleanupError) {
-            console.error('HLS temp cleanup error', cleanupError);
-          }
+        if (asyncMode) {
+          const jobId = startAsyncHlsJob({ url, channelId, messageId });
+          return res.status(202).json({
+            jobId,
+            statusUrl: `/hls/status/${jobId}`,
+          });
         }
 
-        if (!playlistUrl) {
-          return res.status(500).json({ error: 'hls_upload_failed' });
-        }
-
-        return res.json({
-          playlistUrl,
-          durationSeconds,
-        });
+        const result = await convertUrlToHls({ url, channelId, messageId });
+        return res.json(result);
       } catch (err) {
         console.error('HLS conversion error', err);
         return res.status(500).json({ error: 'hls_conversion_failed' });
       }
+    });
+
+    app.get('/hls/status/:jobId', (req, res) => {
+      pruneHlsJobs();
+      const jobId = String(req.params.jobId || '').trim();
+      const job = hlsAsyncJobs.get(jobId);
+      if (!job) {
+        return res.status(404).json({ error: 'job_not_found' });
+      }
+      return res.json(job);
     });
 
     // POST buradan başlıyor...
