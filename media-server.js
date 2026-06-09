@@ -13,6 +13,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const { S3 } = require('@aws-sdk/client-s3');
 const dotenv = require('dotenv');
+const crypto = require('crypto');
 
 dotenv.config();
 
@@ -69,6 +70,112 @@ const LIVE_HLS_BASE_URL =
   || `http://localhost:${PORT}/live`;
 
 let spacesClient;
+
+const HLS_ASYNC_JOB_TTL_MS = parseIntegerEnv(process.env.HLS_ASYNC_JOB_TTL_MS, 60 * 60 * 1000);
+const HLS_ASYNC_JOB_MAX_KEEP = parseIntegerEnv(process.env.HLS_ASYNC_JOB_MAX_KEEP, 200);
+const hlsAsyncJobs = new Map(); // jobId -> { status, createdAt, startedAt, finishedAt, result, error }
+
+function pruneHlsJobs() {
+  const now = Date.now();
+  for (const [id, job] of hlsAsyncJobs.entries()) {
+    if (job && job.createdAt && now - job.createdAt > HLS_ASYNC_JOB_TTL_MS) {
+      hlsAsyncJobs.delete(id);
+    }
+  }
+  const extra = hlsAsyncJobs.size - HLS_ASYNC_JOB_MAX_KEEP;
+  if (extra > 0) {
+    const ids = Array.from(hlsAsyncJobs.keys());
+    for (let i = 0; i < extra; i++) {
+      hlsAsyncJobs.delete(ids[i]);
+    }
+  }
+}
+
+async function convertUrlToHls({ url, channelId, messageId }) {
+  const workDir = await createTempDirectory('hissechat-hls');
+  const sourcePath = path.join(workDir, 'source.mp4');
+
+  await downloadFile(url, sourcePath);
+
+  const hlsDir = path.join(workDir, 'hls');
+  await ensureDirectory(hlsDir);
+
+  const hlsArtifact = await runFfmpegHls(sourcePath, hlsDir, {
+    segmentDurationSeconds: HLS_SEGMENT_DURATION_SECONDS,
+    segmentType: HLS_SEGMENT_TYPE,
+    enableAbr: HLS_ENABLE_ABR,
+  });
+
+  if (HLS_GENERATE_THUMBNAIL) {
+    try {
+      await runFfmpegThumbnail(sourcePath, path.join(hlsDir, 'thumb.jpg'), 1);
+      hlsArtifact.thumbnailRelativePath = 'thumb.jpg';
+    } catch (thumbErr) {
+      console.warn('[hls] thumbnail generation failed', thumbErr.message);
+    }
+  }
+
+  const baseKey =
+    channelId && messageId
+      ? `hls/channel/${channelId}/${messageId}`
+      : `hls/misc/${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  let uploadResult = null;
+
+  try {
+    uploadResult = await uploadHlsDirectoryToSpaces(hlsDir, baseKey, hlsArtifact);
+  } finally {
+    try {
+      await fs.promises.rm(workDir, { recursive: true, force: true });
+    } catch (cleanupError) {
+      console.error('HLS temp cleanup error', cleanupError);
+    }
+  }
+
+  if (!uploadResult?.playlistUrl) {
+    const err = new Error('hls_upload_failed');
+    err.code = 'hls_upload_failed';
+    throw err;
+  }
+
+  return {
+    playlistUrl: uploadResult.playlistUrl,
+    masterPlaylistUrl: uploadResult.masterPlaylistUrl,
+    fallbackPlaylistUrl: uploadResult.fallbackPlaylistUrl,
+    thumbnailUrl: uploadResult.thumbnailUrl,
+    durationSeconds: hlsArtifact.durationSeconds,
+    abrEnabled: hlsArtifact.abrEnabled,
+    segmentType: hlsArtifact.segmentType,
+    renditions: hlsArtifact.renditions,
+  };
+}
+
+function startAsyncHlsJob({ url, channelId, messageId }) {
+  pruneHlsJobs();
+  const jobId = crypto.randomUUID();
+  hlsAsyncJobs.set(jobId, { status: 'queued', createdAt: Date.now() });
+
+  setImmediate(async () => {
+    const job = hlsAsyncJobs.get(jobId);
+    if (!job) return;
+    job.status = 'processing';
+    job.startedAt = Date.now();
+    try {
+      const result = await convertUrlToHls({ url, channelId, messageId });
+      job.status = 'done';
+      job.result = result;
+      job.finishedAt = Date.now();
+    } catch (e) {
+      job.status = 'failed';
+      job.error = (e && e.message) || 'hls_conversion_failed';
+      job.finishedAt = Date.now();
+    }
+    hlsAsyncJobs.set(jobId, job);
+    pruneHlsJobs();
+  });
+
+  return jobId;
+}
 
 function getSpacesClient() {
   if (!SPACES_ENDPOINT || !SPACES_KEY || !SPACES_SECRET || !SPACES_BUCKET || !SPACES_REGION) {
@@ -1233,6 +1340,7 @@ function runFfmpegHls(inputPath, outputDir, options = {}) {
       2,
       parseIntegerEnv(options.segmentDurationSeconds, HLS_SEGMENT_DURATION_SECONDS),
     );
+    const forceKeyFramesExpr = `expr:gte(t,n_forced*${segmentDurationSeconds})`;
     const segmentType = options.segmentType === 'fmp4' ? 'fmp4' : 'mpegts';
     const enableAbr = Boolean(options.enableAbr);
     const segmentExt = segmentType === 'fmp4' ? 'm4s' : 'ts';
@@ -1269,6 +1377,8 @@ function runFfmpegHls(inputPath, outputDir, options = {}) {
         'yuv420p',
         '-sc_threshold',
         '0',
+        '-force_key_frames',
+        forceKeyFramesExpr,
         '-g',
         '48',
         '-keyint_min',
@@ -1357,6 +1467,10 @@ function runFfmpegHls(inputPath, outputDir, options = {}) {
         '23',
         '-pix_fmt',
         'yuv420p',
+        '-sc_threshold',
+        '0',
+        '-force_key_frames',
+        forceKeyFramesExpr,
         '-c:a',
         'aac',
         '-b:a',
@@ -1993,64 +2107,34 @@ app.post('/hls/from-url', async (req, res) => {
   }
 
   try {
-    const workDir = await createTempDirectory('hissechat-hls');
-    const sourcePath = path.join(workDir, 'source.mp4');
+    const asyncMode =
+      String(req.query.async || '').trim() === '1' ||
+      String(req.query.async || '').trim().toLowerCase() === 'true';
 
-    await downloadFile(url, sourcePath);
-
-    const hlsDir = path.join(workDir, 'hls');
-    await ensureDirectory(hlsDir);
-
-    const hlsArtifact = await runFfmpegHls(sourcePath, hlsDir, {
-      segmentDurationSeconds: HLS_SEGMENT_DURATION_SECONDS,
-      segmentType: HLS_SEGMENT_TYPE,
-      enableAbr: HLS_ENABLE_ABR,
-    });
-
-    if (HLS_GENERATE_THUMBNAIL) {
-      try {
-        await runFfmpegThumbnail(sourcePath, path.join(hlsDir, 'thumb.jpg'), 1);
-        hlsArtifact.thumbnailRelativePath = 'thumb.jpg';
-      } catch (thumbErr) {
-        console.warn('[hls] thumbnail generation failed', thumbErr.message);
-      }
+    if (asyncMode) {
+      const jobId = startAsyncHlsJob({ url, channelId, messageId });
+      return res.status(202).json({
+        jobId,
+        statusUrl: `${String(process.env.MEDIA_PUBLIC_BASE_URL || '').trim() || `http://localhost:${PORT}`}/hls/status/${jobId}`,
+      });
     }
 
-    const baseKey =
-      channelId && messageId
-        ? `hls/channel/${channelId}/${messageId}`
-        : `hls/misc/${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-    let uploadResult = null;
-
-    try {
-      uploadResult = await uploadHlsDirectoryToSpaces(hlsDir, baseKey, hlsArtifact);
-    } finally {
-      try {
-        await fs.promises.rm(workDir, { recursive: true, force: true });
-      } catch (cleanupError) {
-        console.error('HLS temp cleanup error', cleanupError);
-      }
-    }
-
-    if (!uploadResult?.playlistUrl) {
-      return res.status(500).json({ error: 'hls_upload_failed' });
-    }
-
-    return res.json({
-      playlistUrl: uploadResult.playlistUrl,
-      masterPlaylistUrl: uploadResult.masterPlaylistUrl,
-      fallbackPlaylistUrl: uploadResult.fallbackPlaylistUrl,
-      thumbnailUrl: uploadResult.thumbnailUrl,
-      durationSeconds: hlsArtifact.durationSeconds,
-      abrEnabled: hlsArtifact.abrEnabled,
-      segmentType: hlsArtifact.segmentType,
-      renditions: hlsArtifact.renditions,
-    });
+    const result = await convertUrlToHls({ url, channelId, messageId });
+    return res.json(result);
   } catch (err) {
     console.error('HLS conversion error', err);
     return res.status(500).json({ error: 'hls_conversion_failed' });
   }
+});
+
+app.get('/hls/status/:jobId', (req, res) => {
+  pruneHlsJobs();
+  const jobId = String(req.params.jobId || '').trim();
+  const job = hlsAsyncJobs.get(jobId);
+  if (!job) {
+    return res.status(404).json({ error: 'job_not_found' });
+  }
+  return res.json(job);
 });
 
 // --- Audio transcode (in-place size/bitrate optimization, no HLS) ---
