@@ -211,6 +211,12 @@ function runFfmpegHls(inputPath, outputDir, options = {}) {
         let artifact;
 
         if (enableAbr) {
+            // Named renditions in var_stream_map are written under v480p/v720p/v1080p.
+            // Pre-create them so ffmpeg can write init/segment files immediately.
+            for (const renditionName of ['480p', '720p', '1080p']) {
+                fs.mkdirSync(path.join(outputDir, `v${renditionName}`), { recursive: true });
+            }
+
             args = [
                 '-y',
                 '-i',
@@ -290,7 +296,7 @@ function runFfmpegHls(inputPath, outputDir, options = {}) {
             ];
 
             if (segmentType === 'fmp4') {
-                args.push('-hls_segment_type', 'fmp4', '-hls_fmp4_init_filename', 'v%v/init.mp4');
+                args.push('-hls_segment_type', 'fmp4', '-hls_fmp4_init_filename', 'init.mp4');
             }
 
             args.push(
@@ -386,7 +392,8 @@ function runFfmpegHls(inputPath, outputDir, options = {}) {
                     abrEnabled: enableAbr,
                 });
             } else {
-                reject(new Error(`ffmpeg exited with code ${code}`));
+                const trimmedStderr = String(stderrBuffer || '').trim();
+                reject(new Error(`ffmpeg exited with code ${code}${trimmedStderr ? `: ${trimmedStderr}` : ''}`));
             }
         });
     });
