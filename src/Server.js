@@ -62,6 +62,15 @@ const Sentry = require('@sentry/node');
 const { CaptureConsole } = require('@sentry/integrations');
 const restrictAccessByIP = require('./middleware/IpWhitelist.js');
 const packageJson = require('../package.json');
+const { convertUrlToHls: convertUrlToHlsJob } = require('./jobs/mediaTranscodeProcessor');
+const {
+    assertQueueAvailable,
+    enqueueTranscodeJob,
+    getQueueAvailability,
+    getTranscodeJobStatus,
+    getWorkerHealth,
+    isQueueEnabled,
+} = require('./jobs/mediaTranscodeQueue');
 
 // E-posta uyarıları ve bildirimleri
 const nodemailer = require('./lib/nodemailer');
@@ -1024,46 +1033,27 @@ function pruneHlsJobs() {
 }
 
 async function convertUrlToHls({ url, channelId, messageId }) {
-  const workDir = await createTempDirectory('hissechat-hls');
-  const sourcePath = path.join(workDir, 'source.mp4');
-
-  await downloadFile(url, sourcePath);
-
-  const hlsDir = path.join(workDir, 'hls');
-  await ensureDirectory(hlsDir);
-
-  const { durationSeconds } = await runFfmpegHls(sourcePath, hlsDir, 6);
-
-  const baseKey =
-    channelId && messageId
-      ? `hls/channel/${channelId}/${messageId}`
-      : `hls/misc/${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-  let playlistUrl = null;
-
-  try {
-    playlistUrl = await uploadHlsDirectoryToSpaces(hlsDir, baseKey);
-  } finally {
-    try {
-      await fs.promises.rm(workDir, { recursive: true, force: true });
-    } catch (cleanupError) {
-      console.error('HLS temp cleanup error', cleanupError);
-    }
-  }
-
-  if (!playlistUrl) {
-    const err = new Error('hls_upload_failed');
-    err.code = 'hls_upload_failed';
-    throw err;
-  }
-
+  const result = await convertUrlToHlsJob({ url, channelId, messageId });
   return {
-    playlistUrl,
-    durationSeconds,
+    playlistUrl: result && result.playlistUrl ? result.playlistUrl : null,
+    durationSeconds: result && result.durationSeconds ? result.durationSeconds : null,
+    masterPlaylistUrl: result && result.masterPlaylistUrl ? result.masterPlaylistUrl : null,
+    fallbackPlaylistUrl: result && result.fallbackPlaylistUrl ? result.fallbackPlaylistUrl : null,
+    thumbnailUrl: result && result.thumbnailUrl ? result.thumbnailUrl : null,
+    abrEnabled: result && typeof result.abrEnabled === 'boolean' ? result.abrEnabled : undefined,
+    segmentType: result && result.segmentType ? result.segmentType : undefined,
+    renditions: result && result.renditions ? result.renditions : undefined,
   };
 }
 
-function startAsyncHlsJob({ url, channelId, messageId }) {
+async function startAsyncHlsJob({ url, channelId, messageId }) {
+  assertQueueAvailable();
+  if (isQueueEnabled()) {
+    const job = await enqueueTranscodeJob('hls-from-url', { url, channelId, messageId });
+    if (job && job.id) {
+      return job.id;
+    }
+  }
   pruneHlsJobs();
   const jobId =
     typeof nodeCrypto.randomUUID === 'function'
@@ -1352,6 +1342,23 @@ function startServer() {
 
     // Health Check
     app.get('/health', (req, res) => res.status(200).send('Media Server OK'));
+    app.get('/health/worker', async (req, res) => {
+      try {
+        const queue = getQueueAvailability();
+        const worker = await getWorkerHealth();
+        const httpStatus = worker.status === 'healthy' || !queue.required ? 200 : 503;
+        return res.status(httpStatus).json({
+          ok: httpStatus === 200,
+          queue,
+          worker,
+        });
+      } catch (err) {
+        return res.status(503).json({
+          ok: false,
+          error: err && err.message ? err.message : 'worker_health_failed',
+        });
+      }
+    });
 
     // HLS Conversion Route
     app.post('/hls/from-url', async (req, res) => {
@@ -1370,7 +1377,7 @@ function startServer() {
           String(req.query.async || '').trim().toLowerCase() === 'true';
 
         if (asyncMode) {
-          const jobId = startAsyncHlsJob({ url, channelId, messageId });
+          const jobId = await startAsyncHlsJob({ url, channelId, messageId });
           return res.status(202).json({
             jobId,
             statusUrl: `/hls/status/${jobId}`,
@@ -1381,13 +1388,20 @@ function startServer() {
         return res.json(result);
       } catch (err) {
         console.error('HLS conversion error', err);
+        if (err && err.code === 'media_transcode_queue_required') {
+          return res.status(503).json({ error: 'media_transcode_queue_required' });
+        }
         return res.status(500).json({ error: 'hls_conversion_failed' });
       }
     });
 
-    app.get('/hls/status/:jobId', (req, res) => {
+    app.get('/hls/status/:jobId', async (req, res) => {
       pruneHlsJobs();
       const jobId = String(req.params.jobId || '').trim();
+      const queuedJob = await getTranscodeJobStatus(jobId);
+      if (queuedJob) {
+        return res.json(queuedJob);
+      }
       const job = hlsAsyncJobs.get(jobId);
       if (!job) {
         return res.status(404).json({ error: 'job_not_found' });
