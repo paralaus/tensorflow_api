@@ -978,3 +978,199 @@ Training skipped by --skip-train.
 
 Training skipped by --skip-train.
 [2026-07-01T02:00:03Z] finetune cron run finished
+[2026-07-02T02:00:01Z] finetune cron run started
+{
+  "collection": "ai_training_logs",
+  "mode": "qa",
+  "total_read": 7018,
+  "written": 7018,
+  "skipped": 0,
+  "output": "data/raw/chat_qa.jsonl"
+}
+{
+  "input": "data/raw/chat_qa.jsonl",
+  "total_rows": 7018,
+  "accepted_rows": 6909,
+  "skipped_rows": 109,
+  "train_rows": 6218,
+  "val_rows": 345,
+  "test_rows": 346,
+  "seed": 42
+}
+
+>>> /root/paralaus-project/.venv/bin/python scripts/export_training_data.py --mongo-uri 'mongodb://ghostchat_root:Pi3AlFa1970@diarss.online:27017/poker?authSource=admin' --db poker --collection ai_training_logs --mode qa --query '{}' --limit 50000 --sort-field createdAt --sort-direction -1 --output data/raw/chat_qa.jsonl --user-field question --assistant-field answer --context-field context
+
+
+>>> /root/paralaus-project/.venv/bin/python scripts/prepare_finetune_dataset.py --input data/raw/chat_qa.jsonl --output-dir data/finetune --train-ratio 0.9 --val-ratio 0.05 --seed 42
+
+
+Training skipped by --skip-train.
+[2026-07-02T02:00:03Z] finetune cron run finished
+[2026-07-03T02:00:01Z] finetune cron run started
+{
+  "collection": "ai_training_logs",
+  "mode": "qa",
+  "total_read": 7082,
+  "written": 7082,
+  "skipped": 0,
+  "output": "data/raw/chat_qa.jsonl"
+}
+{
+  "input": "data/raw/chat_qa.jsonl",
+  "total_rows": 7082,
+  "accepted_rows": 6973,
+  "skipped_rows": 109,
+  "train_rows": 6275,
+  "val_rows": 348,
+  "test_rows": 350,
+  "seed": 42
+}
+
+>>> /root/paralaus-project/.venv/bin/python scripts/export_training_data.py --mongo-uri 'mongodb://ghostchat_root:Pi3AlFa1970@diarss.online:27017/poker?authSource=admin' --db poker --collection ai_training_logs --mode qa --query '{}' --limit 50000 --sort-field createdAt --sort-direction -1 --output data/raw/chat_qa.jsonl --user-field question --assistant-field answer --context-field context
+
+
+>>> /root/paralaus-project/.venv/bin/python scripts/prepare_finetune_dataset.py --input data/raw/chat_qa.jsonl --output-dir data/finetune --train-ratio 0.9 --val-ratio 0.05 --seed 42
+
+
+Training skipped by --skip-train.
+[2026-07-03T02:00:03Z] finetune cron run finished
+[2026-07-04T02:00:01Z] finetune cron run started
+{
+  "collection": "ai_training_logs",
+  "mode": "qa",
+  "total_read": 7150,
+  "written": 7150,
+  "skipped": 0,
+  "output": "data/raw/chat_qa.jsonl"
+}
+{
+  "input": "data/raw/chat_qa.jsonl",
+  "total_rows": 7150,
+  "accepted_rows": 7041,
+  "skipped_rows": 109,
+  "train_rows": 6336,
+  "val_rows": 352,
+  "test_rows": 353,
+  "seed": 42
+}
+
+>>> /root/paralaus-project/.venv/bin/python scripts/export_training_data.py --mongo-uri 'mongodb://ghostchat_root:Pi3AlFa1970@diarss.online:27017/poker?authSource=admin' --db poker --collection ai_training_logs --mode qa --query '{}' --limit 50000 --sort-field createdAt --sort-direction -1 --output data/raw/chat_qa.jsonl --user-field question --assistant-field answer --context-field context
+
+
+>>> /root/paralaus-project/.venv/bin/python scripts/prepare_finetune_dataset.py --input data/raw/chat_qa.jsonl --output-dir data/finetune --train-ratio 0.9 --val-ratio 0.05 --seed 42
+
+
+Training skipped by --skip-train.
+[2026-07-04T02:00:04Z] finetune cron run finished
+[2026-07-05T02:00:01Z] finetune cron run started
+{
+  "collection": "ai_training_logs",
+  "mode": "qa",
+  "total_read": 7183,
+  "written": 7183,
+  "skipped": 0,
+  "output": "data/raw/chat_qa.jsonl"
+}
+{
+  "input": "data/raw/chat_qa.jsonl",
+  "total_rows": 7183,
+  "accepted_rows": 7072,
+  "skipped_rows": 111,
+  "train_rows": 6364,
+  "val_rows": 353,
+  "test_rows": 355,
+  "seed": 42
+}
+
+>>> /root/paralaus-project/.venv/bin/python scripts/export_training_data.py --mongo-uri 'mongodb://ghostchat_root:Pi3AlFa1970@diarss.online:27017/poker?authSource=admin' --db poker --collection ai_training_logs --mode qa --query '{}' --limit 50000 --sort-field createdAt --sort-direction -1 --output data/raw/chat_qa.jsonl --user-field question --assistant-field answer --context-field context
+
+
+>>> /root/paralaus-project/.venv/bin/python scripts/prepare_finetune_dataset.py --input data/raw/chat_qa.jsonl --output-dir data/finetune --train-ratio 0.9 --val-ratio 0.05 --seed 42
+
+
+Training skipped by --skip-train.
+[2026-07-05T02:00:03Z] finetune cron run finished
+[2026-07-06T02:00:01Z] finetune cron run started
+{
+  "collection": "ai_training_logs",
+  "mode": "qa",
+  "total_read": 7206,
+  "written": 7206,
+  "skipped": 0,
+  "output": "data/raw/chat_qa.jsonl"
+}
+{
+  "input": "data/raw/chat_qa.jsonl",
+  "total_rows": 7206,
+  "accepted_rows": 7095,
+  "skipped_rows": 111,
+  "train_rows": 6385,
+  "val_rows": 354,
+  "test_rows": 356,
+  "seed": 42
+}
+
+>>> /root/paralaus-project/.venv/bin/python scripts/export_training_data.py --mongo-uri 'mongodb://ghostchat_root:Pi3AlFa1970@diarss.online:27017/poker?authSource=admin' --db poker --collection ai_training_logs --mode qa --query '{}' --limit 50000 --sort-field createdAt --sort-direction -1 --output data/raw/chat_qa.jsonl --user-field question --assistant-field answer --context-field context
+
+
+>>> /root/paralaus-project/.venv/bin/python scripts/prepare_finetune_dataset.py --input data/raw/chat_qa.jsonl --output-dir data/finetune --train-ratio 0.9 --val-ratio 0.05 --seed 42
+
+
+Training skipped by --skip-train.
+[2026-07-06T02:00:03Z] finetune cron run finished
+[2026-07-07T02:00:01Z] finetune cron run started
+{
+  "collection": "ai_training_logs",
+  "mode": "qa",
+  "total_read": 7300,
+  "written": 7300,
+  "skipped": 0,
+  "output": "data/raw/chat_qa.jsonl"
+}
+{
+  "input": "data/raw/chat_qa.jsonl",
+  "total_rows": 7300,
+  "accepted_rows": 7186,
+  "skipped_rows": 114,
+  "train_rows": 6467,
+  "val_rows": 359,
+  "test_rows": 360,
+  "seed": 42
+}
+
+>>> /root/paralaus-project/.venv/bin/python scripts/export_training_data.py --mongo-uri 'mongodb://ghostchat_root:Pi3AlFa1970@diarss.online:27017/poker?authSource=admin' --db poker --collection ai_training_logs --mode qa --query '{}' --limit 50000 --sort-field createdAt --sort-direction -1 --output data/raw/chat_qa.jsonl --user-field question --assistant-field answer --context-field context
+
+
+>>> /root/paralaus-project/.venv/bin/python scripts/prepare_finetune_dataset.py --input data/raw/chat_qa.jsonl --output-dir data/finetune --train-ratio 0.9 --val-ratio 0.05 --seed 42
+
+
+Training skipped by --skip-train.
+[2026-07-07T02:00:03Z] finetune cron run finished
+[2026-07-08T02:00:01Z] finetune cron run started
+{
+  "collection": "ai_training_logs",
+  "mode": "qa",
+  "total_read": 7352,
+  "written": 7352,
+  "skipped": 0,
+  "output": "data/raw/chat_qa.jsonl"
+}
+{
+  "input": "data/raw/chat_qa.jsonl",
+  "total_rows": 7352,
+  "accepted_rows": 7238,
+  "skipped_rows": 114,
+  "train_rows": 6514,
+  "val_rows": 361,
+  "test_rows": 363,
+  "seed": 42
+}
+
+>>> /root/paralaus-project/.venv/bin/python scripts/export_training_data.py --mongo-uri 'mongodb://ghostchat_root:Pi3AlFa1970@diarss.online:27017/poker?authSource=admin' --db poker --collection ai_training_logs --mode qa --query '{}' --limit 50000 --sort-field createdAt --sort-direction -1 --output data/raw/chat_qa.jsonl --user-field question --assistant-field answer --context-field context
+
+
+>>> /root/paralaus-project/.venv/bin/python scripts/prepare_finetune_dataset.py --input data/raw/chat_qa.jsonl --output-dir data/finetune --train-ratio 0.9 --val-ratio 0.05 --seed 42
+
+
+Training skipped by --skip-train.
+[2026-07-08T02:00:04Z] finetune cron run finished
