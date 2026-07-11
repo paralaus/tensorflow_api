@@ -684,16 +684,6 @@ async function startLiveHlsForRoom(roomId) {
             ...hlsOutputArgsFor(hlsDirLow),
         ];
 
-        // Master playlist (ABR giris noktasi): FFmpeg'in yazdigi bir dosya
-        // degil, sabit icerikli, bizim yazdigimiz bir dosya. Iceriginde
-        // segment/bitrate bilgisi olmadigindan (sadece iki alt playlist'e
-        // isaret eder) yayin boyunca tek sefer yazilir, sonradan degismez.
-        try {
-            await fs.promises.writeFile(path.join(hlsDir, 'index.m3u8'), buildAbrMasterPlaylist(), 'utf8');
-        } catch (e) {
-            log.error(`[live-hls ${roomId}] master playlist write failed: ${e.message}`);
-        }
-
         log.info(`[live-hls ${roomId}] spawning ffmpeg (videoPort=${videoPort}, audioPort=${audioPort ?? 'none'})`);
         ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
 
@@ -783,6 +773,21 @@ async function startLiveHlsForRoom(roomId) {
                     log.error(`[live-hls ${roomId}] uploader init failed: ${e.message}`);
                 }
             }
+        }
+
+        // Master playlist (ABR giris noktasi): FFmpeg'in yazdigi bir dosya
+        // degil, sabit icerikli, bizim yazdigimiz bir dosya. Iceriginde
+        // segment/bitrate bilgisi olmadigindan (sadece iki alt playlist'e
+        // isaret eder) yayin boyunca tek sefer yazilir, sonradan degismez.
+        // ONEMLI: bu yazma islemi uploader'lar (yukarida) OLUSTURULDUKTAN
+        // SONRA yapilmali - 'root' uploader'in fs.watch'i bu yazmadan ONCE
+        // baslamazsa event'i hic gormez ve master playlist Spaces'e ASLA
+        // yuklenmez (CDN'de surekli 403/404 - segment'ler CDN'e cikiyor ama
+        // giris noktasi index.m3u8 hicbir zaman olusmuyor).
+        try {
+            await fs.promises.writeFile(path.join(hlsDir, 'index.m3u8'), buildAbrMasterPlaylist(), 'utf8');
+        } catch (e) {
+            log.error(`[live-hls ${roomId}] master playlist write failed: ${e.message}`);
         }
 
         videoConsumer.on('producerclose', () => {
