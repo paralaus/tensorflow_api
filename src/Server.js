@@ -102,7 +102,9 @@ const SPACES_REGION = process.env.SPACES_REGION;
 //   playlists are served from Spaces and the droplet's egress bandwidth stays
 //   flat regardless of viewer count.
 // SPACES_HLS_PREFIX: key prefix inside the bucket; default 'live'. Each room
-//   is stored under `<prefix>/<roomId>/{index.m3u8,init.mp4,seg_*.m4s}`.
+//   is stored under `<prefix>/<roomId>/index.m3u8` (ABR master playlist) +
+//   `<prefix>/<roomId>/{high,low}/{index.m3u8,init.mp4,seg_*.m4s}` (the two
+//   renditions - see buildAbrMasterPlaylist / startLiveHlsForRoom).
 // SPACES_HLS_RETENTION_SEC: seconds to keep objects after pipeline stop
 //   before bulk-delete. Default 600 (10 min) — enough for replay buffers.
 const SPACES_PUBLIC_BASE_URL = String(process.env.SPACES_PUBLIC_BASE_URL || '').trim();
@@ -135,6 +137,18 @@ const LIVE_HLS_VOD_LOCAL_CLEANUP_SEC = (() => {
     const n = parseInt(process.env.LIVE_HLS_VOD_LOCAL_CLEANUP_SEC, 10);
     return Number.isFinite(n) ? n : 3600;
 })();
+
+// Ayni anda kac live-HLS pipeline (= FFmpeg process) calisabilir. Onceden
+// hicbir sinir yoktu (LIVE_RTP_PORT_BASE..MAX port araligi 200 stream'e kadar
+// izin veriyordu, ki bu CPU acisindan gercekci degil). Transcode yolu
+// '-threads 4' kullaniyor; passthrough (-c:v copy) neredeyse bedava. Bu
+// deger, worker basina makul bir pay birakacak sekilde MEDIASOUP_NUM_WORKERS
+// ile orantili varsayilan alir; ortamda daha fazla/az CPU varsa env ile
+// ayarlanabilir.
+const MAX_CONCURRENT_LIVE_STREAMS = _parseIntEnv(
+    process.env.MAX_CONCURRENT_LIVE_STREAMS,
+    Math.max(4, _parseIntEnv(process.env.MEDIASOUP_NUM_WORKERS, 4) * 2),
+);
 
 // ============================================================================
 // LIVE HLS BROADCAST PIPELINE (PlainTransport -> FFmpeg -> HLS)
@@ -269,8 +283,10 @@ function sanitizeRoomIdForPath(roomId) {
 //   * Sonuna #EXT-X-ENDLIST ekler (player'a "akis bitti, basa sarilabilir"
 //     sinyali verir; seek bar dolu gozukur).
 // Yazma sonrasi fs.watch'i tetikleyip Spaces'e son hali itmek arayanin sorumlulugu.
-async function finalizeVodPlaylist(roomId, hlsDir) {
-    const playlistPath = path.join(hlsDir, 'index.m3u8');
+// playlistPath: rendition'in KENDI media playlist'i (high/index.m3u8 ya da
+// low/index.m3u8) - ABR master playlist'i (kok index.m3u8) burada YOK, o
+// bir media playlist degil, ENDLIST kavrami ona uygulanmaz.
+async function finalizeVodPlaylist(roomId, playlistPath) {
     let text;
     try {
         text = await fs.promises.readFile(playlistPath, 'utf8');
@@ -290,6 +306,25 @@ async function finalizeVodPlaylist(roomId, hlsDir) {
     await fs.promises.writeFile(playlistPath, text, 'utf8');
     log.info(`[live-hls ${roomId}] vod playlist finalized (${text.length} bytes)`);
     return playlistPath;
+}
+
+// ABR giris noktasi: iki sabit rendition'a isaret eden bir HLS master
+// playlist. Bant genisligi degerleri her rendition'in '-maxrate'/'-b:v'
+// ayarlariyla hizali (bkz. videoOutputArgs / lowVideoOutputArgs). CODECS
+// attribute'u kasten atlandi: yuksek katman passthrough modundayken kaynagin
+// tam profile/level'ini bilmiyoruz, yanlis bir CODECS degeri bazi player'larin
+// rendition'i reddetmesine yol acabilir - atlamak HLS spec'ine gore gecerli.
+function buildAbrMasterPlaylist() {
+    return [
+        '#EXTM3U',
+        '#EXT-X-VERSION:7',
+        '#EXT-X-INDEPENDENT-SEGMENTS',
+        '#EXT-X-STREAM-INF:BANDWIDTH=1500000,AVERAGE-BANDWIDTH=1300000,RESOLUTION=1280x720',
+        'high/index.m3u8',
+        '#EXT-X-STREAM-INF:BANDWIDTH=550000,AVERAGE-BANDWIDTH=460000,RESOLUTION=640x360',
+        'low/index.m3u8',
+        '',
+    ].join('\n');
 }
 
 // Pick the first video (and optionally audio) producer in a Room.
@@ -368,6 +403,14 @@ function hasMediasoupRoom(roomId) {
 async function startLiveHlsForRoom(roomId) {
     if (liveHlsPipelines.has(roomId)) return liveHlsPipelines.get(roomId);
 
+    if (liveHlsPipelines.size >= MAX_CONCURRENT_LIVE_STREAMS) {
+        log.error(
+            `[live-hls ${roomId}] refused: ${liveHlsPipelines.size}/${MAX_CONCURRENT_LIVE_STREAMS} ` +
+                'concurrent live pipelines already running'
+        );
+        throw new Error('live_hls_capacity_exceeded');
+    }
+
     const room = resolveMediasoupRoom(roomId);
     if (!room) throw new Error(`live_hls_room_not_found:${roomId}`);
 
@@ -389,19 +432,40 @@ async function startLiveHlsForRoom(roomId) {
     let audioPort = null;
     let ffmpeg = null;
     const hlsDir = path.join(LIVE_HLS_DIR, sanitizeRoomIdForPath(roomId));
+    // ABR: iki rendition ayri alt klasorlere yazilir, kok index.m3u8 ise
+    // FFmpeg tarafindan degil bizim tarafimizdan yazilan sabit bir master
+    // playlist olur (bkz. buildAbrMasterPlaylist). Boylece mevcut client'larin
+    // zaten cagirdigi ".../<roomId>/index.m3u8" URL'i degismeden ABR'a gecer -
+    // uyumlu her HLS player (ExoPlayer/AVPlayer/hls.js) master playlist'i
+    // otomatik tanir ve rendition secimini kendisi yapar.
+    const hlsDirHigh = path.join(hlsDir, 'high');
+    const hlsDirLow = path.join(hlsDir, 'low');
 
     cancelLiveHlsCleanup(roomId, 'pipeline-start');
 
     try {
-        await fs.promises.mkdir(hlsDir, { recursive: true });
+        await fs.promises.mkdir(hlsDirHigh, { recursive: true });
+        await fs.promises.mkdir(hlsDirLow, { recursive: true });
 
+        // Onceki calistirmadan kalan dosyalari (root'ta input.sdp/eski duz
+        // index.m3u8, alt klasorlerde segmentler) sifirla ve segment
+        // numaralandirmasini high/ klasorunden devam ettir (ikisi ayni
+        // numaralandirmayi paylasir - basit ve segment sayilari zaten
+        // wall-clock hizasinda kaliyor).
         let startNumber = 0;
         let resumeFromExisting = false;
         try {
-            const existing = await fs.promises.readdir(hlsDir);
+            const existingRoot = await fs.promises.readdir(hlsDir).catch(() => []);
+            await Promise.all(
+                existingRoot
+                    .filter((f) => f !== 'high' && f !== 'low')
+                    .map((f) => fs.promises.unlink(path.join(hlsDir, f)).catch(() => {})),
+            );
+
+            const existingHigh = await fs.promises.readdir(hlsDirHigh);
             let maxSeg = -1;
-            for (const f of existing) {
-                const m = f.match(/^seg_(\d+)\.ts$/);
+            for (const f of existingHigh) {
+                const m = f.match(/^seg_(\d+)\.m4s$/);
                 if (m) {
                     const n = parseInt(m[1], 10);
                     if (Number.isFinite(n) && n > maxSeg) maxSeg = n;
@@ -413,9 +477,11 @@ async function startLiveHlsForRoom(roomId) {
                 log.info(`[live-hls ${roomId}] resuming segment numbering at ${startNumber}`);
             } else {
                 await Promise.all(
-                    existing.map((f) =>
-                        fs.promises.unlink(path.join(hlsDir, f)).catch(() => {}),
-                    ),
+                    existingHigh.map((f) => fs.promises.unlink(path.join(hlsDirHigh, f)).catch(() => {})),
+                );
+                const existingLow = await fs.promises.readdir(hlsDirLow).catch(() => []);
+                await Promise.all(
+                    existingLow.map((f) => fs.promises.unlink(path.join(hlsDirLow, f)).catch(() => {})),
                 );
             }
         } catch (_) {}
@@ -516,6 +582,59 @@ async function startLiveHlsForRoom(roomId) {
                 '-x264-params', 'sliced-threads=1:sync-lookahead=0:rc-lookahead=0',
             ];
 
+        // ABR dusuk katman: her zaman transcode edilir (kucuk cozunurluk,
+        // ucuz encode). Yuksek katmanin passthrough avantajini bozmaz - sadece
+        // ikinci, hafif bir encode eklenir. Kotu agdaki izleyiciye dusuk
+        // bant genisligi secenegi sunar; CPU maliyeti 720p transcode yolundan
+        // cok daha kucuktur (360p, 2 thread, 400kbps).
+        const lowVideoOutputArgs = [
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-tune', 'zerolatency',
+            '-profile:v', 'baseline',
+            '-level', '3.0',
+            '-pix_fmt', 'yuv420p',
+            '-vf', 'scale=-2:360,format=yuv420p',
+            '-force_key_frames', 'expr:gte(t,n_forced*2)',
+            '-sc_threshold', '0',
+            '-threads', '2',
+            '-b:v', '400k',
+            '-maxrate', '500k',
+            '-bufsize', '1000k',
+            '-x264-params', 'sliced-threads=1:sync-lookahead=0:rc-lookahead=0',
+        ];
+
+        // HLS muxer flag'leri iki rendition icin ortak; sadece cikti klasoru
+        // (dolayisiyla segment/init/playlist yolu) degisir.
+        const hlsOutputArgsFor = (dir) => [
+            '-f', 'hls',
+            // Mobile-friendly HLS: 2s segments x 8 list = 16s playlist
+            // window. Bigger than LL-HLS but much more resilient to mobile
+            // network jitter (TCP slow-start has time to ramp, players can
+            // pre-buffer ~3-4 segments before showing first frame).
+            // Glass-to-glass latency ~6-10s, acceptable for broadcast.
+            // +temp_file ensures players never read half-written segments.
+            '-hls_time', '2',
+            // VOD modunda kayan pencere YOK; tum segmentler kalir ki yayin
+            // bittikten sonra basa sarilabilsin. Canli modda mobil network
+            // jitter'a dayanikli 8x2sn=16sn pencere kullaniriz.
+            '-hls_list_size', LIVE_HLS_VOD_ENABLED ? '0' : '8',
+            '-hls_flags', (() => {
+                // delete_segments: live moddayken eski segmentleri diskten
+                //   ve playlistten siler. VOD'da ASLA olmamali, yoksa replay
+                //   yapacak segment kalmaz.
+                const base = LIVE_HLS_VOD_ENABLED
+                    ? 'independent_segments+omit_endlist+program_date_time+temp_file'
+                    : 'delete_segments+independent_segments+omit_endlist+program_date_time+temp_file';
+                return resumeFromExisting ? `${base}+append_list` : base;
+            })(),
+            '-hls_segment_type', 'fmp4',
+            '-hls_fmp4_init_filename', 'init.mp4',
+            '-start_number', String(startNumber),
+            '-hls_segment_filename', path.join(dir, 'seg_%05d.m4s'),
+            path.join(dir, 'index.m3u8'),
+        ];
+
         const ffmpegArgs = [
             '-loglevel', 'warning',
             // -stats: warning seviyesinde bile periyodik "frame=.. fps=.. bitrate=.."
@@ -542,6 +661,7 @@ async function startLiveHlsForRoom(roomId) {
             '-max_delay', '5000000',
             '-reorder_queue_size', '16384',
             '-i', sdpPath,
+            // ---- Yuksek katman (mevcut davranis, degismedi) ----
             '-map', '0:v:0',
             ...(audioConsumer ? ['-map', '0:a:0'] : []),
             ...videoOutputArgs,
@@ -552,33 +672,27 @@ async function startLiveHlsForRoom(roomId) {
                    // DTS" warnings + occasional audio drops on the client.
                    '-af', 'aresample=async=1:first_pts=0']
                 : []),
-            '-f', 'hls',
-            // Mobile-friendly HLS: 2s segments x 8 list = 16s playlist
-            // window. Bigger than LL-HLS but much more resilient to mobile
-            // network jitter (TCP slow-start has time to ramp, players can
-            // pre-buffer ~3-4 segments before showing first frame).
-            // Glass-to-glass latency ~6-10s, acceptable for broadcast.
-            // +temp_file ensures players never read half-written segments.
-            '-hls_time', '2',
-            // VOD modunda kayan pencere YOK; tum segmentler kalir ki yayin
-            // bittikten sonra basa sarilabilsin. Canli modda mobil network
-            // jitter'a dayanikli 8x2sn=16sn pencere kullaniriz.
-            '-hls_list_size', LIVE_HLS_VOD_ENABLED ? '0' : '8',
-            '-hls_flags', (() => {
-                // delete_segments: live moddayken eski segmentleri diskten
-                //   ve playlistten siler. VOD'da ASLA olmamali, yoksa replay
-                //   yapacak segment kalmaz.
-                const base = LIVE_HLS_VOD_ENABLED
-                    ? 'independent_segments+omit_endlist+program_date_time+temp_file'
-                    : 'delete_segments+independent_segments+omit_endlist+program_date_time+temp_file';
-                return resumeFromExisting ? `${base}+append_list` : base;
-            })(),
-            '-hls_segment_type', 'fmp4',
-            '-hls_fmp4_init_filename', 'init.mp4',
-            '-start_number', String(startNumber),
-            '-hls_segment_filename', path.join(hlsDir, 'seg_%05d.m4s'),
-            path.join(hlsDir, 'index.m3u8'),
+            ...hlsOutputArgsFor(hlsDirHigh),
+            // ---- Dusuk katman (yeni, ABR) - ayni input'tan ikinci cikti ----
+            '-map', '0:v:0',
+            ...(audioConsumer ? ['-map', '0:a:0'] : []),
+            ...lowVideoOutputArgs,
+            ...(audioConsumer
+                ? ['-c:a', 'aac', '-b:a', '64k', '-ar', '48000', '-ac', '2',
+                   '-af', 'aresample=async=1:first_pts=0']
+                : []),
+            ...hlsOutputArgsFor(hlsDirLow),
         ];
+
+        // Master playlist (ABR giris noktasi): FFmpeg'in yazdigi bir dosya
+        // degil, sabit icerikli, bizim yazdigimiz bir dosya. Iceriginde
+        // segment/bitrate bilgisi olmadigindan (sadece iki alt playlist'e
+        // isaret eder) yayin boyunca tek sefer yazilir, sonradan degismez.
+        try {
+            await fs.promises.writeFile(path.join(hlsDir, 'index.m3u8'), buildAbrMasterPlaylist(), 'utf8');
+        } catch (e) {
+            log.error(`[live-hls ${roomId}] master playlist write failed: ${e.message}`);
+        }
 
         log.info(`[live-hls ${roomId}] spawning ffmpeg (videoPort=${videoPort}, audioPort=${audioPort ?? 'none'})`);
         ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -618,6 +732,8 @@ async function startLiveHlsForRoom(roomId) {
         const pipeline = {
             roomId,
             hlsDir,
+            hlsDirHigh,
+            hlsDirLow,
             ffmpeg,
             videoTransport,
             audioTransport,
@@ -631,7 +747,10 @@ async function startLiveHlsForRoom(roomId) {
             stopping: false,
             kfTimers: [],
             kfInterval: null,
-            uploader: null,
+            // ABR: uc ayri uploader (kok master.m3u8 + iki rendition alt klasoru).
+            // fs.watch recursive degil (Linux'ta guvenilir degil), o yuzden her
+            // klasor kendi watcher'ina sahip olmali.
+            uploaders: null,
         };
         liveHlsPipelines.set(roomId, pipeline);
 
@@ -642,14 +761,24 @@ async function startLiveHlsForRoom(roomId) {
             const s3 = getSpacesClient();
             if (s3) {
                 try {
-                    pipeline.uploader = createSpacesHlsUploader({
-                        s3,
-                        bucket: SPACES_BUCKET,
-                        localDir: hlsDir,
-                        keyPrefix: `${SPACES_HLS_PREFIX}/${sanitizeRoomIdForPath(roomId)}`,
-                        logInfo: (m) => log.info(`[live-hls ${roomId}] ${m}`),
-                        logError: (m) => log.error(`[live-hls ${roomId}] ${m}`),
-                    });
+                    const roomKeyPrefix = `${SPACES_HLS_PREFIX}/${sanitizeRoomIdForPath(roomId)}`;
+                    const mkUploader = (localDir, keyPrefix) =>
+                        createSpacesHlsUploader({
+                            s3,
+                            bucket: SPACES_BUCKET,
+                            localDir,
+                            keyPrefix,
+                            logInfo: (m) => log.info(`[live-hls ${roomId}] ${m}`),
+                            logError: (m) => log.error(`[live-hls ${roomId}] ${m}`),
+                        });
+                    pipeline.uploaders = {
+                        // Kok: sadece master index.m3u8 (fs.watch bu klasorde artik
+                        // baska tracked-extension dosya gormez, high/low kendi
+                        // klasorlerine tasindi).
+                        root: mkUploader(hlsDir, roomKeyPrefix),
+                        high: mkUploader(hlsDirHigh, `${roomKeyPrefix}/high`),
+                        low: mkUploader(hlsDirLow, `${roomKeyPrefix}/low`),
+                    };
                 } catch (e) {
                     log.error(`[live-hls ${roomId}] uploader init failed: ${e.message}`);
                 }
@@ -754,16 +883,21 @@ async function stopLiveHlsForRoom(roomId) {
 
     // ---- VOD finalize (replay) ----
     // Yayin bittikten sonra ayni playback URL'i VOD olarak servis edebilmek
-    // icin playlist'i ENDLIST ile kapatip Spaces'e son halini yazariz.
+    // icin HER IKI rendition playlist'ini ENDLIST ile kapatip Spaces'e son
+    // halini yazariz. Master (kok) playlist ENDLIST gerektirmez - o bir media
+    // playlist degil, iceriginde zaten degisen bir sey yok.
     let vodFinalized = false;
-    if (LIVE_HLS_VOD_ENABLED && p.hlsDir) {
+    if (LIVE_HLS_VOD_ENABLED && p.hlsDirHigh && p.hlsDirLow) {
         try {
-            const finalized = await finalizeVodPlaylist(roomId, p.hlsDir);
-            if (finalized) {
+            const [finalizedHigh, finalizedLow] = await Promise.all([
+                finalizeVodPlaylist(roomId, path.join(p.hlsDirHigh, 'index.m3u8')),
+                finalizeVodPlaylist(roomId, path.join(p.hlsDirLow, 'index.m3u8')),
+            ]);
+            if (finalizedHigh || finalizedLow) {
                 vodFinalized = true;
-                // fs.watch debounce penceresi (150ms) gecsin ki uploader
-                // finalize edilmis index.m3u8'i Spaces'e PUT'lasin; sonra
-                // uploader.stop() in-flight PUT'i drenaj eder.
+                // fs.watch debounce penceresi (150ms) gecsin ki uploader'lar
+                // finalize edilmis index.m3u8'leri Spaces'e PUT'lasin; sonra
+                // uploader.stop() in-flight PUT'leri drenaj eder.
                 await new Promise((r) => setTimeout(r, 300));
             }
         } catch (e) {
@@ -771,18 +905,20 @@ async function stopLiveHlsForRoom(roomId) {
         }
     }
 
-    // Spaces uploader'i durdur (in-flight PUT'lari drenaj eder). VOD modunda
-    // ASLA deleteRemote cagirmiyoruz; aksi halde replay icin gereken
-    // segmentler silinir. Live-only modda eski davranis korunuyor.
-    if (p.uploader) {
-        const up = p.uploader;
-        Promise.resolve()
-            .then(() => up.stop())
+    // Spaces uploader'larini durdur (in-flight PUT'lari drenaj eder). VOD
+    // modunda ASLA deleteRemote cagirmiyoruz; aksi halde replay icin gereken
+    // segmentler silinir. Live-only modda eski davranis korunuyor. deleteRemote
+    // sadece 'root' uploader uzerinden cagrilir - S3 prefix listeleme
+    // hiyerarsik oldugundan (root prefix'i high/low alt yollarini da kapsar)
+    // tek cagri ucunu de temizler.
+    if (p.uploaders) {
+        const { root, high, low } = p.uploaders;
+        Promise.allSettled([root.stop(), high.stop(), low.stop()])
             .then(() => {
                 if (vodFinalized) return; // VOD: segmentleri Spaces'te birak
-                if (SPACES_HLS_RETENTION_SEC <= 0) return up.deleteRemote();
+                if (SPACES_HLS_RETENTION_SEC <= 0) return root.deleteRemote();
                 setTimeout(() => {
-                    up.deleteRemote().catch(() => {});
+                    root.deleteRemote().catch(() => {});
                 }, SPACES_HLS_RETENTION_SEC * 1000).unref();
             })
             .catch((e) => log.error(`[live-hls ${roomId}] uploader teardown: ${e.message}`));
@@ -1939,6 +2075,17 @@ function startServer() {
                 } else if (filePath.endsWith('.ts')) {
                     res.setHeader('Cache-Control', 'public, max-age=10');
                     res.setHeader('Content-Type', 'video/mp2t');
+                } else if (filePath.endsWith('.m4s')) {
+                    // Live pipeline uses fMP4 segments (-hls_segment_type fmp4), not
+                    // .ts. Content-addressed (seg_%05d.m4s never rewritten) so this
+                    // can be cached aggressively, same as SpacesHlsUploader.js does
+                    // for the CDN-served path.
+                    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+                    res.setHeader('Content-Type', 'video/iso.segment');
+                } else if (filePath.endsWith('.mp4')) {
+                    // init.mp4 (fMP4 init segment) - same immutability as .m4s.
+                    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+                    res.setHeader('Content-Type', 'video/mp4');
                 }
             },
         }),
@@ -1975,7 +2122,10 @@ function startServer() {
             replayEnabled: LIVE_HLS_VOD_ENABLED,
             replayUrl: LIVE_HLS_VOD_ENABLED ? hlsUrl : null,
             replayReady: false,
-            llhls: true,
+            // Standart HLS (2s segment, 16s pencere) - gercek LL-HLS (EXT-X-PART /
+            // partial segment) uygulanmiyor. Yanlis "true" degeri client tarafinda
+            // low-latency mod beklentisi yaratabilirdi; duzeltildi.
+            llhls: false,
             status: 'provisioned',
             createdAt: new Date().toISOString(),
         };
