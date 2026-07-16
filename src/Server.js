@@ -1266,6 +1266,14 @@ conferenceSocketMod.setOnProducerAddedHook((roomId) => {
     }
 });
 
+// AI konferans katilimcisi (Faz 1: sadece ses) - gercek /conference odasina
+// sahte bir mediasoup peer olarak katilip insan sesini dinler, cevap verir.
+const aiConferencePeer = require('./AiConferencePeer')(io, {
+    rooms: conferenceSocketMod.rooms,
+    logInfo: (...a) => log.info('[ai-peer]', ...a),
+    logError: (...a) => log.error('[ai-peer]', ...a),
+});
+
 
 const host = 'https://' + 'localhost' + ':' + config.server.listen.port; // config.server.listen.ip
 
@@ -2199,6 +2207,39 @@ function startServer() {
             session.streamEndedAt = new Date().toISOString();
         }
         return res.json({ ok: true, roomId });
+    });
+
+    // AI konferans katilimcisi: odaya sesli katil / ayril. roomId, ConferenceSocket.js
+    // ('/conference' namespace) uzerinden zaten aktif bir odaya ait olmali (en az bir
+    // insan katilimcinin sesi acik/producer'i olusmus olmali).
+    app.post('/conference/:roomId/ai-peer/join', async (req, res) => {
+        const roomId = String(req.params.roomId || '').trim();
+        if (!roomId) return res.status(400).json({ error: 'roomId_required' });
+        try {
+            const result = await aiConferencePeer.joinRoom(roomId);
+            return res.json(result);
+        } catch (e) {
+            log.error(`[ai-peer] join failed for ${roomId}: ${e.message}`);
+            return res.status(409).json({ error: e.message });
+        }
+    });
+
+    app.post('/conference/:roomId/ai-peer/leave', async (req, res) => {
+        const roomId = String(req.params.roomId || '').trim();
+        if (!roomId) return res.status(400).json({ error: 'roomId_required' });
+        try {
+            const result = await aiConferencePeer.leaveRoom(roomId);
+            return res.json(result);
+        } catch (e) {
+            log.error(`[ai-peer] leave failed for ${roomId}: ${e.message}`);
+            return res.status(500).json({ error: e.message });
+        }
+    });
+
+    app.get('/conference/:roomId/ai-peer/status', (req, res) => {
+        const roomId = String(req.params.roomId || '').trim();
+        if (!roomId) return res.status(400).json({ error: 'roomId_required' });
+        return res.json({ roomId, active: aiConferencePeer.isActive(roomId) });
     });
 
     app.get('/live-broadcast/session/:roomId', (req, res) => {
