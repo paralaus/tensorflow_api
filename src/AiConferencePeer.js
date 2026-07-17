@@ -178,15 +178,15 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
       log.info(`[${roomId}] duyulan: "${text}"`);
 
       peerState.state = 'thinking';
-      const chatRes = await axios.post(`${AI_SERVICE_INTERNAL_URL}/chat`, {
-        question: text,
+      // /psychology/chat (AI Psikolog sistem promptu + kriz tespiti) - bu
+      // katilimci sadece "AI Psikolog" ekraninin Goruntulu butonundan
+      // baslatiliyor, genel hissechat finans asistani (/chat) DEGIL.
+      const chatRes = await axios.post(`${AI_SERVICE_INTERNAL_URL}/psychology/chat`, {
+        message: text,
         history: peerState.history.slice(-10),
-        detailLevel: 'brief',
-        context: {
-          channelName: 'Canli konferans (sesli katilimci)',
-        },
+        level: 1,
       }, { timeout: 30000, headers: aiServiceHeaders() });
-      const answer = (chatRes.data && (chatRes.data.answer || chatRes.data.text) || '').trim();
+      const answer = (chatRes.data && chatRes.data.answer || '').trim();
       if (!answer) {
         peerState.state = 'listening';
         return;
@@ -279,12 +279,25 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
   async function joinRoom(roomId) {
     if (activePeers.has(roomId)) return { alreadyJoined: true, roomId };
 
-    const room = rooms.get(roomId);
+    // The caller (e.g. a mobile client) typically triggers this right after
+    // its own 'room-joined' event, which can fire slightly before its audio
+    // producer is actually registered server-side. Poll briefly instead of
+    // failing on that race - up to ~10s for both the room and a human
+    // producer to show up.
+    let room = null;
+    let humanProducer = null;
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline) {
+      room = rooms.get(roomId);
+      if (room) {
+        humanProducer = findHumanAudioProducer(room);
+        if (humanProducer) break;
+      }
+      await new Promise((r) => setTimeout(r, 400));
+    }
     if (!room) throw new Error(`room_not_found:${roomId}`);
-    const router = room.router;
-
-    const humanProducer = findHumanAudioProducer(room);
     if (!humanProducer) throw new Error('no_human_audio_producer_in_room');
+    const router = room.router;
 
     const fakeSocketId = `ai-peer-${crypto.randomUUID()}`;
     const peerState = {
