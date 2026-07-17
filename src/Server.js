@@ -2215,8 +2215,9 @@ function startServer() {
     app.post('/conference/:roomId/ai-peer/join', async (req, res) => {
         const roomId = String(req.params.roomId || '').trim();
         if (!roomId) return res.status(400).json({ error: 'roomId_required' });
+        const authToken = String((req.body && req.body.authToken) || '').trim();
         try {
-            const result = await aiConferencePeer.joinRoom(roomId);
+            const result = await aiConferencePeer.joinRoom(roomId, { authToken });
             return res.json(result);
         } catch (e) {
             log.error(`[ai-peer] join failed for ${roomId}: ${e.message}`);

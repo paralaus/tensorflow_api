@@ -42,3 +42,15 @@ pysqlite3-binary>=0.5.0; sys_platform == "linux"
 # torch>=2.1.0
 # accelerate>=0.25.0
 # sentencepiece>=0.1.99
+
+# AI Psikolog goruntulu gorusmede dusuk-guvenilirlikli duygu ipucu (opsiyonel;
+# bagimliliklar yoksa /psychology/emotion-hint devre disi kalir, bkz. app.py).
+# DeepFace ilk calistirmada onceden egitilmis model agirliklarini indirir
+# (~100-300MB), CPU'da calisir ama GPU olmadan turn basina 0.5-2s ekleyebilir.
+deepface>=0.0.93
+opencv-python-headless>=4.9.0
+# TensorFlow 2.16+ varsayilan olarak Keras 3'e gecti, ama DeepFace hala eski
+# tf.keras API'sini bekliyor - tf-keras uyumluluk paketi olmadan DeepFace
+# import hatasi verip devre disi kaliyor (uygulama cokmez, sadece yuz analizi
+# calismaz - bkz. app.py'deki try/except).
+tf-keras>=2.16.0

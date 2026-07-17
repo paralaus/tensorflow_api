@@ -32,12 +32,16 @@ except Exception as _e:  # pragma: no cover
 _ENABLED = os.environ.get("TRAINING_LOG_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 _DB_NAME = os.environ.get("TRAINING_LOG_DB", "poker")
 _COLLECTION_NAME = os.environ.get("TRAINING_LOG_COLLECTION", "ai_training_logs")
+# AI Psikolog sohbetleri finans Q&A'sindan AYRI bir koleksiyona yaziliyor -
+# hassas kisisel saglik/terapi verisi, farkli erisim/saklama/silme
+# politikalari gerektirebilecegi icin ayni koleksiyonda karistirilmiyor.
+PSYCH_COLLECTION_NAME = os.environ.get("TRAINING_LOG_PSYCH_COLLECTION", "ai_psychology_training_logs")
 _MAX_Q = int(os.environ.get("TRAINING_LOG_MAX_QUESTION", "4000"))
 _MAX_A = int(os.environ.get("TRAINING_LOG_MAX_ANSWER", "8000"))
 _MIN_A = int(os.environ.get("TRAINING_LOG_MIN_ANSWER", "8"))
 
 _client = None
-_collection = None
+_collections: dict[str, object] = {}
 _lock = threading.Lock()
 _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="train-log")
 _disabled_reason: str | None = None
@@ -52,12 +56,13 @@ def _resolve_uri() -> str | None:
     )
 
 
-def _get_collection():
-    global _client, _collection, _disabled_reason
+def _get_collection(name: str | None = None):
+    global _client, _disabled_reason
     if not _ENABLED or not _HAS_PYMONGO:
         return None
-    if _collection is not None:
-        return _collection
+    coll_name = name or _COLLECTION_NAME
+    if coll_name in _collections:
+        return _collections[coll_name]
     uri = _resolve_uri()
     if not uri:
         if _disabled_reason is None:
@@ -65,26 +70,26 @@ def _get_collection():
             print("[training_logger] MONGODB_URI yok, devre disi.")
         return None
     with _lock:
-        if _collection is not None:
-            return _collection
+        if coll_name in _collections:
+            return _collections[coll_name]
         try:
-            _client = MongoClient(
-                uri,
-                serverSelectionTimeoutMS=2000,
-                connectTimeoutMS=2000,
-                socketTimeoutMS=3000,
-                appname="hissechat-training-logger",
-            )
+            if _client is None:
+                _client = MongoClient(
+                    uri,
+                    serverSelectionTimeoutMS=2000,
+                    connectTimeoutMS=2000,
+                    socketTimeoutMS=3000,
+                    appname="hissechat-training-logger",
+                )
             db = _client[_DB_NAME]
-            _collection = db[_COLLECTION_NAME]
-            print(
-                f"[training_logger] aktif: db={_DB_NAME} collection={_COLLECTION_NAME}"
-            )
+            coll = db[coll_name]
+            _collections[coll_name] = coll
+            print(f"[training_logger] aktif: db={_DB_NAME} collection={coll_name}")
+            return coll
         except Exception as e:
             _disabled_reason = f"connect_error:{e}"
             print(f"[training_logger] Mongo baglanti hatasi: {e}")
             return None
-    return _collection
 
 
 def _clean(value: Any, limit: int) -> str:
@@ -111,8 +116,8 @@ def _serialize_context(context: Any) -> Any:
         return None
 
 
-def _write(doc: dict) -> None:
-    coll = _get_collection()
+def _write(doc: dict, collection: str | None = None) -> None:
+    coll = _get_collection(collection)
     if coll is None:
         return
     try:
@@ -135,6 +140,7 @@ def log_sample(
     cached: bool = False,
     source: str = "chat",
     extra: dict | None = None,
+    collection: str | None = None,
 ) -> None:
     """Fire-and-forget kayit. Hata firlatmaz."""
     if not _ENABLED:
@@ -170,7 +176,7 @@ def log_sample(
         except Exception:
             pass
     try:
-        _executor.submit(_write, doc)
+        _executor.submit(_write, doc, collection)
     except Exception as e:
         print(f"[training_logger] submit hata: {e}")
 
@@ -181,6 +187,7 @@ def status() -> dict:
         "has_pymongo": _HAS_PYMONGO,
         "db": _DB_NAME,
         "collection": _COLLECTION_NAME,
-        "connected": _collection is not None,
+        "psych_collection": PSYCH_COLLECTION_NAME,
+        "connected_collections": list(_collections.keys()),
         "disabled_reason": _disabled_reason,
     }
