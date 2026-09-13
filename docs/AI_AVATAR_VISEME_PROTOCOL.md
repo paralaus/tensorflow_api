@@ -136,6 +136,54 @@ Avatar iki backend ile çalışır. `.riv` dosyası yoksa **prosedürel yedek**
 yani avatar hiçbir koşulda boş kutu olmaz. Şu an repoda `.riv` yok; yedek
 aktif.
 
+### Yedeğe düşmeyi iki katman garanti eder
+
+İlk sürümde yedek **yeterli değildi ve uygulama çöküyordu** — AI odaya
+girip avatar ilk kez çizildiğinde. Sebep ve alınan ders:
+
+`require('rive-react-native')`'ı try/catch'e almak native modülün
+eksikliğini **yakalamaz.** JS modülü sorunsuz yüklenir; hata `<Rive>` ilk
+render edildiğinde React tarafında
+`View config not found for component 'RiveReactNativeView'` invariant'ı
+olarak atılır. Platform farkı önemli:
+
+- **iOS**, pod kurulu değilken import anında `new NativeEventEmitter(undefined)`
+  yüzünden atar → try/catch yakalar, sorun görünmez
+- **Android**, import'u sorunsuz geçer → **render'da çöker**
+
+Bu yüzden `AiAvatar.tsx` iki katman kullanıyor:
+
+1. **`isRiveNativeAvailable()`** — render etmeden önce native view manager'ın
+   gerçekten kayıtlı olduğunu yoklar. Yeni mimaride (bridgeless) doğru ve
+   hata atmayan yol `UIManager.hasViewManagerConfig`; `getViewManagerConfig`
+   orada "soft error" üretip `null` döner.
+2. **`RiveErrorBoundary`** — yoklamanın kaçırdığı her şeyi yakalar (RN
+   sürüm/mimari farkından gelen yanlış pozitif, bozuk `.riv`). Render
+   sırasında atılan bir hatayı **yalnızca** error boundary yakalayabilir.
+
+Her iki katmanın regresyon testi:
+`src/components/conference/__tests__/AiAvatar.riveFallback.test.tsx`
+
+### Animasyonlar JS sürücüsünde
+
+`AiAvatar` uygulamadaki tek `useNativeDriver` kullanıcısıydı ve o yol da
+çöküyordu: repodaki `react` (19.2.8) ile `react-native`'in paketlediği
+renderer (19.1.4) sürümleri uyuşmuyor, native sürücü yolu renderer'a
+dokunduğu anda dev renderer `Incompatible React versions` hatası atıyor —
+AI odaya girdikten ~2-6 saniye sonra (ilk göz kırpma ya da `listening`
+nabzı) çökme.
+
+Göz kırpma/nabız küçük ve seyrek animasyonlar olduğu için JS sürücüsü
+fazlasıyla yeterli (`USE_NATIVE_DRIVER = false`). Performans açısından
+kritik olan ağız hareketi zaten timing animasyonu kullanmıyor —
+`Animated.Value`'ya doğrudan `setValue` ile yazılıyor, o yol etkilenmiyor.
+
+**Bu bir latent repo sorunu:** `react-native@0.81.6`'nın peer aralığı
+(`react@^19.1.4`) 19.2.8'i kabul ettiği için paket yöneticisi uyarmıyor, ama
+RN'in paketlediği renderer 19.1.4'e sabit. İleride native sürücü kullanmak
+isteyen her kod aynı duvara çarpar. Kalıcı çözüm `react`'i 19.1.x'e
+sabitlemek; o yapıldığında `USE_NATIVE_DRIVER` true'ya çevrilebilir.
+
 Tasarımcının üretmesi gereken dosya:
 
 | | Değer |
