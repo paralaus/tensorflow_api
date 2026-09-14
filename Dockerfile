@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     python3-pip \
     ffmpeg \
-    && curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
@@ -17,7 +17,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy package.json and install Node.js dependencies
-ENV MEDIASOUP_SKIP_WORKER_PREBUILT_DOWNLOAD=true
+ENV MEDIASOUP_FORCE_WORKER_PREBUILT_DOWNLOAD=true
 ENV MESON_ARGS="-Dms_disable_liburing=true"
 COPY package.json .
 RUN npm install
