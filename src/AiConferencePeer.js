@@ -58,6 +58,21 @@ const TMP_DIR = process.env.AI_PEER_TMP_DIR || path.join(os.tmpdir(), 'ai-confer
 // configured, set AI_PEER_API_KEY to one of those keys so these internal
 // server-to-server calls keep working.
 const AI_PEER_API_KEY = process.env.AI_PEER_API_KEY || '';
+
+// Seviyeye gore TTS ses eslemeleri (OpenAI & DigitalOcean TTS uyumlu).
+// Seviye 1 (Ogrenci): nova (genc, enerjik)
+// Seviye 2 (Arastirmaci): fable (merakli, dinamik)
+// Seviye 3 (Danisman): shimmer (sicak, empatik)
+// Seviye 4 (Kidemli Danisman): echo (sakin, dengeli)
+// Seviye 5 (Bas Danisman): onyx (olgun, tok, bilge)
+const LEVEL_VOICES = {
+  1: process.env.AI_PEER_VOICE_LVL1 || 'nova',
+  2: process.env.AI_PEER_VOICE_LVL2 || 'fable',
+  3: process.env.AI_PEER_VOICE_LVL3 || 'shimmer',
+  4: process.env.AI_PEER_VOICE_LVL4 || 'echo',
+  5: process.env.AI_PEER_VOICE_LVL5 || 'onyx',
+};
+
 function aiServiceHeaders(extra) {
   const headers = { ...extra };
   if (AI_PEER_API_KEY) headers['X-API-Key'] = AI_PEER_API_KEY;
@@ -489,6 +504,8 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
       userId: 'ai-peer',
       socketId: peerState.fakeSocketId,
       state: clientState,
+      level: peerState.level || 1,
+      levelName: peerState.levelName || 'PsyAtlas Ogrenci',
     });
   }
 
@@ -690,6 +707,10 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
           ...(emotionHint ? { emotionHint } : {}),
         }, { timeout: 30000, headers: { Authorization: `Bearer ${peerState.authToken}` } });
         answer = (chatRes.data && chatRes.data.answer || '').trim();
+        if (chatRes.data && chatRes.data.level) {
+          peerState.level = chatRes.data.level;
+          peerState.levelName = chatRes.data.levelName || peerState.levelName;
+        }
       } else {
         // authToken yoksa (eski/kimliksiz cagri) eski davranisa geri don:
         // tensorflow_api'nin kendi /psychology/chat'i, sadece bu gorusme
@@ -710,8 +731,12 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
       }
       log.info(`[${roomId}] cevap: "${answer.slice(0, 120)}"`);
 
+      const voice = LEVEL_VOICES[peerState.level] || 'alloy';
+      log.info(`[${roomId}] ses sentezleniyor (seviye: ${peerState.level || 1}, ses: ${voice})...`);
+
       const speakRes = await axios.post(`${AI_SERVICE_INTERNAL_URL}/speak`, {
         text: answer,
+        voice,
         format: 'mp3',
       }, { timeout: 30000, responseType: 'arraybuffer', headers: aiServiceHeaders() });
 
@@ -814,12 +839,31 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
     if (!humanProducer) throw new Error('no_human_audio_producer_in_room');
     const router = room.router;
 
+    let initialLevel = 1;
+    let initialLevelName = 'PsyAtlas Ogrenci';
+    if (authToken) {
+      try {
+        const histRes = await axios.get(`${TERAPI_AI_BACKEND_URL}/ai-psychologist/history`, {
+          timeout: 5000,
+          headers: { Authorization: `Bearer ${authToken}` },
+        });
+        if (histRes.data && histRes.data.level) {
+          initialLevel = histRes.data.level;
+          initialLevelName = histRes.data.levelName || initialLevelName;
+        }
+      } catch (e) {
+        log.warn(`[${roomId}] baslangic seviyesi alinamadi (1 varsayiliyor): ${e.message}`);
+      }
+    }
+
     const fakeSocketId = `ai-peer-${crypto.randomUUID()}`;
     const peerState = {
       roomId,
       room,
       fakeSocketId,
       state: 'idle',
+      level: initialLevel,
+      levelName: initialLevelName,
       // setPeerState'in tekrarli olay gondermesini engelleyen son duyurulan
       // client durumu; 'idle' baslangicta duyurulmadi, ilk gercek gecis
       // (listening) gonderilecek.
@@ -946,6 +990,15 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
     // produce() broadcast, using conferenceNsp since we have no real socket
     // to call socket.to() from).
     announceAiProducer(roomId, speak0.producer, fakeSocketId);
+
+    conferenceNsp.to(roomId).emit('ai:avatar-state', {
+      roomId,
+      userId: 'ai-peer',
+      socketId: fakeSocketId,
+      state: 'idle',
+      level: initialLevel,
+      levelName: initialLevelName,
+    });
 
     activePeers.set(roomId, peerState);
     log.info(`[${roomId}] AI peer odaya katildi (listenPort=${listenPort}, speakPort=${peerState.speakPort})`);
