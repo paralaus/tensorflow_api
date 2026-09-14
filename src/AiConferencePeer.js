@@ -60,13 +60,14 @@ const TMP_DIR = process.env.AI_PEER_TMP_DIR || path.join(os.tmpdir(), 'ai-confer
 const AI_PEER_API_KEY = process.env.AI_PEER_API_KEY || '';
 
 // Seviyeye gore TTS ses eslemeleri (OpenAI & DigitalOcean TTS uyumlu).
-// Seviye 1 (Ogrenci): nova (genc, enerjik)
-// Seviye 2 (Arastirmaci): fable (merakli, dinamik)
-// Seviye 3 (Danisman): shimmer (sicak, empatik)
-// Seviye 4 (Kidemli Danisman): echo (sakin, dengeli)
-// Seviye 5 (Bas Danisman): onyx (olgun, tok, bilge)
+// Seviye 3 kadin (ai_avatar_3.riv), diger seviyeler erkek.
+// Seviye 1 (Ogrenci - Erkek): alloy (genc, enerjik, samimi)
+// Seviye 2 (Arastirmaci - Erkek): fable (merakli, dinamik, analitik)
+// Seviye 3 (Danisman - Kadin): shimmer (sicak, empatik, sefkatli)
+// Seviye 4 (Kidemli Danisman - Erkek): echo (sakin, olgun, dengeli)
+// Seviye 5 (Bas Danisman - Erkek): onyx (derin, tok, bilge)
 const LEVEL_VOICES = {
-  1: process.env.AI_PEER_VOICE_LVL1 || 'nova',
+  1: process.env.AI_PEER_VOICE_LVL1 || 'alloy',
   2: process.env.AI_PEER_VOICE_LVL2 || 'fable',
   3: process.env.AI_PEER_VOICE_LVL3 || 'shimmer',
   4: process.env.AI_PEER_VOICE_LVL4 || 'echo',
