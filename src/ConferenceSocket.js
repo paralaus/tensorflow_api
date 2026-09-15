@@ -174,17 +174,37 @@ async function persistKickOnBackend(roomId, targetUserId, hostToken) {
 // Cap configurable via MEDIASOUP_NUM_WORKERS env (defaults to number of CPUs,
 // max 8 so a stray giant droplet doesn't blow port ranges).
 const os = require('os');
+const { describeWorkerFailure } = require('./mediasoupWorkerError');
+
 async function runMediasoupWorkers() {
   const envCount = parseInt(process.env.MEDIASOUP_NUM_WORKERS, 10);
-  const numWorkers = Number.isFinite(envCount) && envCount > 0
+  let numWorkers = Number.isFinite(envCount) && envCount > 0
     ? envCount
     : Math.min(os.cpus().length, 8);
-  console.log(`[ConferenceSocket] Creating ${numWorkers} mediasoup workers (cpus=${os.cpus().length})...`);
 
   // Spread the configured RTP port range evenly across workers so each
   // worker gets a disjoint slice. Without this, two workers would fight
   // for the same port pool and randomly fail on bind.
   const totalPorts = mediasoupConfig.worker.rtcMaxPort - mediasoupConfig.worker.rtcMinPort + 1;
+
+  if (!Number.isFinite(totalPorts) || totalPorts < 2) {
+    throw new Error(
+      `[ConferenceSocket] Invalid RTP port range ${mediasoupConfig.worker.rtcMinPort}-${mediasoupConfig.worker.rtcMaxPort}; ` +
+      'check MEDIASOUP_MIN_PORT / MEDIASOUP_MAX_PORT.'
+    );
+  }
+
+  // Never hand a worker an empty (or overlapping) slice: with more workers
+  // than ports the slices would collide and transports would fail to bind.
+  if (numWorkers > totalPorts) {
+    console.warn(
+      `[ConferenceSocket] ${numWorkers} workers requested but only ${totalPorts} RTP ports available; capping workers to ${totalPorts}.`
+    );
+    numWorkers = totalPorts;
+  }
+
+  console.log(`[ConferenceSocket] Creating ${numWorkers} mediasoup workers (cpus=${os.cpus().length})...`);
+
   const portsPerWorker = Math.floor(totalPorts / numWorkers);
 
   for (let i = 0; i < numWorkers; i++) {
@@ -193,12 +213,24 @@ async function runMediasoupWorkers() {
       ? mediasoupConfig.worker.rtcMaxPort
       : rtcMinPort + portsPerWorker - 1;
 
-    const worker = await mediasoup.createWorker({
-      logLevel: mediasoupConfig.worker.logLevel,
-      logTags: mediasoupConfig.worker.logTags,
-      rtcMinPort,
-      rtcMaxPort,
-    });
+    let worker;
+
+    try {
+      worker = await mediasoup.createWorker({
+        logLevel: mediasoupConfig.worker.logLevel,
+        logTags: mediasoupConfig.worker.logTags,
+        rtcMinPort,
+        rtcMaxPort,
+      });
+    } catch (err) {
+      // mediasoup only reports `[pid:NN, code:NN, signal:null]` here; the
+      // worker's own stderr explaining why is routed through `debug` and is
+      // invisible unless DEBUG is set. Print what the exit code means so the
+      // container log is actionable on its own.
+      console.error(`[ConferenceSocket] Failed to create mediasoup worker ${i}: ${err && err.message}`);
+      console.error(describeWorkerFailure(err));
+      throw err;
+    }
 
     worker.on('died', () => {
       console.error(`[ConferenceSocket] Mediasoup worker ${i} died, exiting...`);
