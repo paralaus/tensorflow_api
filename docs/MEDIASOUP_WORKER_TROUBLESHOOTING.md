@@ -121,7 +121,30 @@ FAILED` satirini basar.
 ## Port araligi notu
 
 Konferans tarafi (`src/ConferenceSocket.js`) RTP portlarini
-`MEDIASOUP_MIN_PORT`-`MEDIASOUP_MAX_PORT` (varsayilan 40000-40100) araligindan
-dagitir ve bu araligi worker sayisina boler. `Dockerfile` da ayni araligi
-`EXPOSE` eder. Bu araligin droplet firewall'unda **UDP ve TCP** olarak acik
-olmasi gerekir; aksi halde worker'lar saglikli baslasa bile medya akmaz.
+`MEDIASOUP_MIN_PORT`-`MEDIASOUP_MAX_PORT` araligindan dagitir ve bu araligi
+worker sayisina boler. Kod varsayilani 40000-40100'dur, ancak
+`docker-compose.yml` bu degiskenleri **10000-19999** olarak veriyor; gecerli
+olan compose'daki degerdir.
+
+Deployment `network_mode: host` ile calistigi icin `EXPOSE` ve port mapping
+devre disidir: erisimi tamamen UFW + DO Cloud Firewall belirler. Bu araligin
+**UDP** olarak acik olmasi gerekir (TCP fallback kullaniliyorsa TCP de); aksi
+halde worker'lar saglikli baslasa bile medya akmaz.
+
+## `exec ./start.sh: no such file or directory`
+
+Container acilisinda bu hatayi goruyorsaniz dosya eksik demek **degildir**;
+cogunlukla `start.sh` CRLF satir sonlariyla image'a girmistir. Kernel shebang'i
+`#!/bin/bash\r` olarak okur, bu isimde bir yorumlayici olmadigi icin exec
+"no such file or directory" ile duser.
+
+Image icindeki dosyayi kontrol edin (satir sonunda `\r` gorunuyorsa sebep budur):
+
+```bash
+docker run --rm --entrypoint sh <image> -c 'head -1 /app/start.sh | od -c | head -2'
+```
+
+Repo tarafinda iki koruma var: `.gitattributes` icindeki `*.sh text eol=lf` her
+checkout'ta LF zorlar, `Dockerfile` da build sirasinda `sed -i 's/\r$//'` ile CR
+karakterlerini temizler ve `CMD ["/bin/bash", "./start.sh"]` kullanarak
+shebang'e bagimliligi kaldirir.

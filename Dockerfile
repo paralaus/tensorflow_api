@@ -43,10 +43,19 @@ COPY . .
 # Expose ports
 # 8000: Flask API
 # 4000: Media Server (Socket.io)
-# 40000-40100: WebRTC Media Ports (UDP/TCP) - must match
-#              MEDIASOUP_MIN_PORT / MEDIASOUP_MAX_PORT (see src/ConferenceSocket.js)
-EXPOSE 8000 4000 40000-40100
+# 10000-19999: WebRTC Media Ports (UDP/TCP). The real range comes from
+#              MEDIASOUP_MIN_PORT / MEDIASOUP_MAX_PORT at runtime; these values
+#              mirror the defaults used by docker-compose. Note that the
+#              deployment runs with `network_mode: host`, where EXPOSE is purely
+#              documentation and the firewall (UFW / DO Cloud Firewall) is what
+#              actually decides reachability.
+EXPOSE 8000 4000 10000-19999
 
-# Run startup script
-RUN chmod +x ./start.sh
-CMD ["./start.sh"]
+# Run startup script.
+# `sed` strips CR from CRLF line endings: a start.sh checked out or copied from
+# Windows gets the shebang `#!/bin/bash\r`, whose interpreter does not exist, and
+# the container dies at boot with the misleading
+# `exec ./start.sh: no such file or directory`. Invoking bash explicitly in CMD
+# removes the remaining dependency on the shebang and the +x bit.
+RUN sed -i 's/\r$//' ./start.sh && chmod +x ./start.sh
+CMD ["/bin/bash", "./start.sh"]
