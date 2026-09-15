@@ -9,12 +9,24 @@
  * that audio back into the room as its own producer — indistinguishable to
  * other peers from a normal participant's audio track.
  *
- * This is Phase 1 (audio-only, no video track). It reuses the exact
- * PlainTransport.consume() pattern already proven in Server.js's live-HLS
- * pipeline for the LISTEN side, and adds a new PlainTransport.produce()
- * pattern (validated in isolation against a real mediasoup worker before
- * being wired in here) for the SPEAK side, which has no prior example
- * anywhere in this codebase.
+ * It reuses the exact PlainTransport.consume() pattern already proven in
+ * Server.js's live-HLS pipeline for the LISTEN side, and adds a new
+ * PlainTransport.produce() pattern (validated in isolation against a real
+ * mediasoup worker before being wired in here) for the SPEAK side, which has
+ * no prior example anywhere in this codebase.
+ *
+ * KONUSAN AVATAR: sunucu video ENCODE ETMIYOR. Her utterance icin TTS
+ * sesinden bir viseme (agiz sekli) zaman cizelgesi cikarilip (src/visemes.js)
+ * socket.io ile client'a gonderiliyor; avatari client kendi GPU'sunda
+ * canlandiriyor. Boylece oturum basina GPU/encode maliyeti ve ~300kbps
+ * downlink ortadan kalkiyor, gecikmeye hicbir sey eklenmiyor.
+ *
+ * Eski yol (her utterance icin 3 kareli RMS animasyonunu ffmpeg ile VP8
+ * RTP'ye encode edip odaya ayri bir video producer olarak basmak)
+ * AI_PEER_LEGACY_VIDEO_TRACK=1 ile hala acilabiliyor - amaci SADECE
+ * yayin gecisi: magazalardan henuz guncellenmemis mobil surumler viseme
+ * olayini bilmedigi icin avatari hic gormez, bu bayrak onlara eski
+ * goruntuyu geri verir. Mobil benimseme tamamlaninca kaldirilabilir.
  *
  * Turn-taking: no VAD library dependency. FFmpeg's own `silencedetect` audio
  * filter (applied to the same RTP the AI is listening to) marks turn
@@ -29,6 +41,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const axios = require('axios');
+const { buildVisemeTimeline, VISEME_SET } = require('./visemes');
 
 const AI_SERVICE_INTERNAL_URL = (process.env.AI_SERVICE_INTERNAL_URL || 'http://127.0.0.1:8000').replace(/\/$/, '');
 // terapi_ai/server (separate domain/host from this service - see
@@ -45,6 +58,22 @@ const TMP_DIR = process.env.AI_PEER_TMP_DIR || path.join(os.tmpdir(), 'ai-confer
 // configured, set AI_PEER_API_KEY to one of those keys so these internal
 // server-to-server calls keep working.
 const AI_PEER_API_KEY = process.env.AI_PEER_API_KEY || '';
+
+// Seviyeye gore TTS ses eslemeleri (OpenAI & DigitalOcean TTS uyumlu).
+// Seviye 3 kadin (ai_avatar_3.riv), diger seviyeler erkek.
+// Seviye 1 (Ogrenci - Erkek): alloy (genc, enerjik, samimi)
+// Seviye 2 (Arastirmaci - Erkek): fable (merakli, dinamik, analitik)
+// Seviye 3 (Danisman - Kadin): shimmer (sicak, empatik, sefkatli)
+// Seviye 4 (Kidemli Danisman - Erkek): echo (sakin, olgun, dengeli)
+// Seviye 5 (Bas Danisman - Erkek): onyx (derin, tok, bilge)
+const LEVEL_VOICES = {
+  1: process.env.AI_PEER_VOICE_LVL1 || 'alloy',
+  2: process.env.AI_PEER_VOICE_LVL2 || 'fable',
+  3: process.env.AI_PEER_VOICE_LVL3 || 'shimmer',
+  4: process.env.AI_PEER_VOICE_LVL4 || 'echo',
+  5: process.env.AI_PEER_VOICE_LVL5 || 'onyx',
+};
+
 function aiServiceHeaders(extra) {
   const headers = { ...extra };
   if (AI_PEER_API_KEY) headers['X-API-Key'] = AI_PEER_API_KEY;
@@ -62,6 +91,12 @@ const SILENCE_MIN_SEC = parseFloat(process.env.AI_PEER_SILENCE_SEC || '1.2');
 const MIN_TURN_SEC = 0.6;
 // Hard cap so a stuck/very long monologue doesn't record forever.
 const MAX_TURN_SEC = 25;
+
+// Eski sunucu-tarafi VP8 avatar yolunu geri acar (bkz. dosya basindaki
+// "KONUSAN AVATAR" notu). Varsayilan KAPALI: viseme metadata'si tek basina
+// yeterli ve ucuz. Sadece guncellenmemis mobil surumler icin yayin
+// gecisinde 1 yapilir.
+const LEGACY_VIDEO_TRACK = process.env.AI_PEER_LEGACY_VIDEO_TRACK === '1';
 
 // RTP port pool for this module's PlainTransports. Deliberately a separate
 // range from Server.js's live-HLS pool (60000-60400) and the main mediasoup
@@ -142,12 +177,19 @@ function buildVideoConsumeSdp({ port, payloadType, mimeSubtype = 'VP8', clockRat
 }
 
 // ---------------------------------------------------------------------
-// Basit "konusan avatar" videosu (Faz 2 - lite). Gercek viseme/fonem
-// eslemesi ya da GPU'lu bir lip-sync modeli YOK; bunun yerine TTS
-// sesinin kisa pencereli RMS zarfini olcup 3 sabit agiz karesi
-// (kapali/yari-acik/acik) arasinda gecis yapiyoruz. Izole testle
-// dogrulandi: mediasoup gercekten bu VP8 RTP'yi kabul edip consumer'a
-// iletiyor (producer/consumer.getStats() ile olculdu).
+// ESKI YOL - sadece AI_PEER_LEGACY_VIDEO_TRACK=1 ile calisir.
+// Sunucu-tarafi "konusan avatar" videosu: TTS sesinin kisa pencereli RMS
+// zarfini olcup 3 sabit agiz karesi (kapali/yari-acik/acik) arasinda gecis
+// yapar, ffmpeg ile VP8 RTP'ye encode edip odaya ayri bir video producer
+// olarak basar. Izole testle dogrulandi: mediasoup bu VP8 RTP'yi kabul edip
+// consumer'a iletiyor (producer/consumer.getStats() ile olculdu).
+//
+// Varsayilan olarak DEVRE DISI; yerini src/visemes.js + 'ai:viseme-timeline'
+// olayi aldi (bkz. dosya basindaki "KONUSAN AVATAR" notu). Burada tutulma
+// sebebi sadece yayin gecisi: guncellenmemis mobil surumler viseme olayini
+// bilmiyor. Mobil benimseme tamamlaninca bu bolum (AVATAR_* sabitleri,
+// ensureAvatarFrames, buildMouthFrameSequence, sendTalkingVideoRtp ve
+// createSpeakVideoProducer) tumuyle silinebilir.
 // ---------------------------------------------------------------------
 function run(cmd, args) {
   return new Promise((resolve, reject) => {
@@ -432,23 +474,81 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
   }
 
   // ---------------------------------------------------------------------
+  // Client'a gonderilen avatar olaylari. Ikisi de "ates-ve-unut": eski
+  // mobil surumler bu olaylari bilmedigi icin sessizce yok sayar, yani
+  // yayin gecisi icin guvenli.
+  // ---------------------------------------------------------------------
+
+  // Ic durumlarin client'a acilan kaba karsiligi. 'transcribing' ile
+  // 'thinking' ayrimi avatar icin anlamsiz - ikisi de "dusunuyor".
+  const CLIENT_STATE = {
+    idle: 'idle',
+    listening: 'listening',
+    transcribing: 'thinking',
+    thinking: 'thinking',
+    speaking: 'speaking',
+  };
+
+  /**
+   * peerState.state'i degistirir ve degisimi odaya duyurur. Avatarin
+   * dinliyor/dusunuyor/konusuyor gorunumunu bu olay suruyor; tek yazma
+   * noktasi olmasi durumun sessizce kaymasini engelliyor.
+   */
+  function setPeerState(peerState, state) {
+    if (peerState.state === state) return;
+    peerState.state = state;
+    const clientState = CLIENT_STATE[state] || 'idle';
+    if (peerState.lastAnnouncedState === clientState) return;
+    peerState.lastAnnouncedState = clientState;
+    conferenceNsp.to(peerState.roomId).emit('ai:avatar-state', {
+      roomId: peerState.roomId,
+      userId: 'ai-peer',
+      socketId: peerState.fakeSocketId,
+      state: clientState,
+      level: peerState.level || 1,
+      levelName: peerState.levelName || 'PsyAtlas Ogrenci',
+    });
+  }
+
+  /**
+   * Bir utterance'in viseme zaman cizelgesini odaya gonderir. Cizelgedeki
+   * `t` degerleri utterance'in BASINDAN itibaren milisaniye; client bunu
+   * kendi saatinde, WebRTC jitter buffer gecikmesini telafi eden sabit bir
+   * offset ile calistirir (bkz. mobile useAiVisemePlayer).
+   */
+  function emitVisemeTimeline(peerState, utteranceId, timeline) {
+    conferenceNsp.to(peerState.roomId).emit('ai:viseme-timeline', {
+      roomId: peerState.roomId,
+      userId: 'ai-peer',
+      socketId: peerState.fakeSocketId,
+      utteranceId,
+      durationMs: timeline.durationMs,
+      frameMs: timeline.frameMs,
+      visemeSet: VISEME_SET,
+      visemes: timeline.visemes,
+    });
+  }
+
+  // ---------------------------------------------------------------------
   // SPEAK side: encode a TTS audio buffer to RTP and send it through a FRESH
   // producer for this utterance (see createSpeakProducer for why fresh, not
   // reused). The previous utterance's producer/transport are closed first.
-  // Alongside the audio, also generates+sends a simple RMS-driven "talking
-  // avatar" video track (see createSpeakVideoProducer / sendTalkingVideoRtp)
-  // - best-effort: any failure there is logged and swallowed so audio never
-  // depends on video working.
+  // Sesle birlikte, ayni sesten cikarilmis viseme zaman cizelgesi client'a
+  // gonderilir (LEGACY_VIDEO_TRACK acikken ek olarak eski VP8 video
+  // track'i de uretilir). Her ikisi de best-effort: buradaki bir hata
+  // loglanip yutulur, ses ASLA avatara bagli degildir.
   // ---------------------------------------------------------------------
   async function speak(peerState, audioBuffer) {
     const { roomId, room } = peerState;
     const inputPath = path.join(TMP_DIR, `speak-in-${roomId}-${Date.now()}.mp3`);
     await fs.promises.writeFile(inputPath, audioBuffer);
 
-    peerState.state = 'speaking';
+    setPeerState(peerState, 'speaking');
+    const utteranceId = crypto.randomUUID();
     let fresh = null;
     let freshVideo = null;
     let frameKeys = null;
+    let timeline = null;
     try {
       fresh = await createSpeakProducer(room.router);
 
@@ -461,14 +561,29 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
       peerState.speakPayloadType = fresh.payloadType;
       peerState.speakSsrc = fresh.ssrc;
 
+      // Viseme cizelgesi: TTS sesini bir kez 16kHz mono PCM'e cozup
+      // src/visemes.js'e veriyoruz (~8s ses icin ~30ms CPU, olculdu).
+      // Hata halinde avatar sadece "konusuyor" durumunda kalir, agzi
+      // hareket etmez - ses etkilenmez.
+      let pcm = null;
       try {
-        await ensureAvatarFrames();
-        const pcm = await decodePcm16(inputPath, 16000);
-        frameKeys = buildMouthFrameSequence(pcm);
-        freshVideo = await createSpeakVideoProducer(room.router);
-      } catch (videoErr) {
-        log.error(`[${roomId}] dudak animasyonu hazirlanamadi, sadece ses ile devam: ${videoErr.message}`);
-        freshVideo = null;
+        pcm = await decodePcm16(inputPath, 16000);
+        timeline = buildVisemeTimeline(pcm);
+      } catch (visemeErr) {
+        log.error(`[${roomId}] viseme cizelgesi cikarilamadi: ${visemeErr.message}`);
+        timeline = null;
+      }
+
+      if (LEGACY_VIDEO_TRACK) {
+        try {
+          await ensureAvatarFrames();
+          if (!pcm) pcm = await decodePcm16(inputPath, 16000);
+          frameKeys = buildMouthFrameSequence(pcm);
+          freshVideo = await createSpeakVideoProducer(room.router);
+        } catch (videoErr) {
+          log.error(`[${roomId}] eski VP8 dudak animasyonu hazirlanamadi, sadece ses ile devam: ${videoErr.message}`);
+          freshVideo = null;
+        }
       }
 
       const oldVideoProducer = peerState.speakVideoProducer;
@@ -498,6 +613,19 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
       try { oldVideoProducer && oldVideoProducer.close(); } catch (_) {}
       try { oldVideoTransport && oldVideoTransport.close(); } catch (_) {}
 
+      // Cizelgeyi ffmpeg'i spawn etmeye HEMEN once gonderiyoruz: socket
+      // yolu (~birkac ms) RTP yolundan (ffmpeg baslatma + client jitter
+      // buffer, ~150-250ms) belirgin sekilde hizli, bu fark client'ta sabit
+      // bir offset ile telafi ediliyor. Sirayi tersine cevirmek offseti
+      // ffmpeg baslatma suresi kadar oynak yapardi.
+      if (timeline) {
+        try {
+          emitVisemeTimeline(peerState, utteranceId, timeline);
+        } catch (emitErr) {
+          log.error(`[${roomId}] viseme cizelgesi gonderilemedi: ${emitErr.message}`);
+        }
+      }
+
       const sendAudio = new Promise((resolve, reject) => {
         const ff = spawn('ffmpeg', [
           '-y', '-re', '-i', inputPath,
@@ -517,7 +645,7 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
 
       const sendVideo = freshVideo
         ? sendTalkingVideoRtp(frameKeys, freshVideo.port, freshVideo.payloadType, freshVideo.ssrc)
-            .catch((e) => log.error(`[${roomId}] dudak animasyonu gonderilemedi: ${e.message}`))
+            .catch((e) => log.error(`[${roomId}] eski VP8 dudak animasyonu gonderilemedi: ${e.message}`))
         : Promise.resolve();
 
       await Promise.all([sendAudio, sendVideo]);
@@ -525,7 +653,10 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
       log.error(`[${roomId}] speak() failed: ${e.message}`);
     } finally {
       fs.promises.unlink(inputPath).catch(() => {});
-      if (!peerState.stopped) peerState.state = 'listening';
+      // Konusma bitti: 'listening'e donmek client'a ayni zamanda "agzi
+      // kapat" sinyali veriyor, cizelge kisa/yanlis kalsa bile avatar
+      // acik agizda takili kalmiyor.
+      if (!peerState.stopped) setPeerState(peerState, 'listening');
     }
   }
 
@@ -538,7 +669,7 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
       const stat = await fs.promises.stat(wavPath).catch(() => null);
       if (!stat || stat.size < 8000) return; // near-empty segment, skip (no real speech)
 
-      peerState.state = 'transcribing';
+      setPeerState(peerState, 'transcribing');
       const form = new (require('form-data'))();
       form.append('file', fs.createReadStream(wavPath), { filename: 'turn.wav' });
       form.append('language', 'tr');
@@ -554,12 +685,12 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
       const transcribeRes = await transcribePromise;
       const text = (transcribeRes.data && transcribeRes.data.text || '').trim();
       if (!text) {
-        peerState.state = 'listening';
+        setPeerState(peerState, 'listening');
         return;
       }
       log.info(`[${roomId}] duyulan: "${text}"`);
 
-      peerState.state = 'thinking';
+      setPeerState(peerState, 'thinking');
       const emotionHint = await Promise.race([
         emotionHintPromise,
         new Promise((resolve) => setTimeout(() => resolve(null), 500)),
@@ -577,6 +708,10 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
           ...(emotionHint ? { emotionHint } : {}),
         }, { timeout: 30000, headers: { Authorization: `Bearer ${peerState.authToken}` } });
         answer = (chatRes.data && chatRes.data.answer || '').trim();
+        if (chatRes.data && chatRes.data.level) {
+          peerState.level = chatRes.data.level;
+          peerState.levelName = chatRes.data.levelName || peerState.levelName;
+        }
       } else {
         // authToken yoksa (eski/kimliksiz cagri) eski davranisa geri don:
         // tensorflow_api'nin kendi /psychology/chat'i, sadece bu gorusme
@@ -592,13 +727,17 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
         peerState.history.push({ text: answer, isUser: false });
       }
       if (!answer) {
-        peerState.state = 'listening';
+        setPeerState(peerState, 'listening');
         return;
       }
       log.info(`[${roomId}] cevap: "${answer.slice(0, 120)}"`);
 
+      const voice = LEVEL_VOICES[peerState.level] || 'alloy';
+      log.info(`[${roomId}] ses sentezleniyor (seviye: ${peerState.level || 1}, ses: ${voice})...`);
+
       const speakRes = await axios.post(`${AI_SERVICE_INTERNAL_URL}/speak`, {
         text: answer,
+        voice,
         format: 'mp3',
       }, { timeout: 30000, responseType: 'arraybuffer', headers: aiServiceHeaders() });
 
@@ -606,7 +745,7 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
       await speak(peerState, Buffer.from(speakRes.data));
     } catch (e) {
       log.error(`[${roomId}] handleTurn hatasi: ${e.message}`);
-      if (!peerState.stopped) peerState.state = 'listening';
+      if (!peerState.stopped) setPeerState(peerState, 'listening');
     } finally {
       fs.promises.unlink(wavPath).catch(() => {});
     }
@@ -625,7 +764,7 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
       peerState.listenRetryTimer = setTimeout(() => startListenTurn(peerState), 500);
       return;
     }
-    peerState.state = 'listening';
+    setPeerState(peerState, 'listening');
 
     const wavPath = path.join(TMP_DIR, `turn-${peerState.roomId}-${Date.now()}.wav`);
     const ff = spawn('ffmpeg', [
@@ -701,12 +840,35 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
     if (!humanProducer) throw new Error('no_human_audio_producer_in_room');
     const router = room.router;
 
+    let initialLevel = 1;
+    let initialLevelName = 'PsyAtlas Ogrenci';
+    if (authToken) {
+      try {
+        const histRes = await axios.get(`${TERAPI_AI_BACKEND_URL}/ai-psychologist/history`, {
+          timeout: 5000,
+          headers: { Authorization: `Bearer ${authToken}` },
+        });
+        if (histRes.data && histRes.data.level) {
+          initialLevel = histRes.data.level;
+          initialLevelName = histRes.data.levelName || initialLevelName;
+        }
+      } catch (e) {
+        log.warn(`[${roomId}] baslangic seviyesi alinamadi (1 varsayiliyor): ${e.message}`);
+      }
+    }
+
     const fakeSocketId = `ai-peer-${crypto.randomUUID()}`;
     const peerState = {
       roomId,
       room,
       fakeSocketId,
       state: 'idle',
+      level: initialLevel,
+      levelName: initialLevelName,
+      // setPeerState'in tekrarli olay gondermesini engelleyen son duyurulan
+      // client durumu; 'idle' baslangicta duyurulmadi, ilk gercek gecis
+      // (listening) gonderilecek.
+      lastAnnouncedState: null,
       stopped: false,
       history: [],
       authToken: authToken || '',
@@ -830,6 +992,15 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
     // to call socket.to() from).
     announceAiProducer(roomId, speak0.producer, fakeSocketId);
 
+    conferenceNsp.to(roomId).emit('ai:avatar-state', {
+      roomId,
+      userId: 'ai-peer',
+      socketId: fakeSocketId,
+      state: 'idle',
+      level: initialLevel,
+      levelName: initialLevelName,
+    });
+
     activePeers.set(roomId, peerState);
     log.info(`[${roomId}] AI peer odaya katildi (listenPort=${listenPort}, speakPort=${peerState.speakPort})`);
 
@@ -864,6 +1035,15 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
 
     const room = rooms.get(roomId);
     if (room) room.peers.delete(peerState.fakeSocketId);
+
+    // Avatari 'idle'a dusur: aksi halde client son durumda ('speaking' ya da
+    // 'listening') takili kalir.
+    conferenceNsp.to(roomId).emit('ai:avatar-state', {
+      roomId,
+      userId: 'ai-peer',
+      socketId: peerState.fakeSocketId,
+      state: 'idle',
+    });
 
     activePeers.delete(roomId);
     log.info(`[${roomId}] AI peer odadan ayrildi`);
