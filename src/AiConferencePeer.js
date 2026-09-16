@@ -566,13 +566,14 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
       ]);
 
       let answer = '';
+      let chatRes = null;
       if (peerState.authToken) {
         // Bu katilimci "AI Psikolog" ekraninin Goruntulu butonundan baslatildi
         // ve kullanicinin kendi JWT'si var - terapi_ai/server'in
         // /ai-psychologist/chat'ini cagirarak metin/sesli sohbetle AYNI
         // gecmisi (AIConversationMessage), seviyeyi ve profil ozetini
         // kullaniyoruz, boylece bu gorusme de kalici hafizaya isleniyor.
-        const chatRes = await axios.post(`${TERAPI_AI_BACKEND_URL}/ai-psychologist/chat`, {
+        chatRes = await axios.post(`${TERAPI_AI_BACKEND_URL}/ai-psychologist/chat`, {
           message: text,
           ...(emotionHint ? { emotionHint } : {}),
         }, { timeout: 30000, headers: { Authorization: `Bearer ${peerState.authToken}` } });
@@ -581,7 +582,7 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
         // authToken yoksa (eski/kimliksiz cagri) eski davranisa geri don:
         // tensorflow_api'nin kendi /psychology/chat'i, sadece bu gorusme
         // suresince yasayan bellek-ici gecmisle.
-        const chatRes = await axios.post(`${AI_SERVICE_INTERNAL_URL}/psychology/chat`, {
+        chatRes = await axios.post(`${AI_SERVICE_INTERNAL_URL}/psychology/chat`, {
           message: text,
           history: peerState.history.slice(-10),
           level: 1,
@@ -597,9 +598,22 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
       }
       log.info(`[${roomId}] cevap: "${answer.slice(0, 120)}"`);
 
+      const aiLevel = (chatRes && chatRes.data && chatRes.data.level) || peerState.level || 1;
+      peerState.level = aiLevel;
+      // Seviye ve yasa gore ses: 1-2 genc erkek (echo), 3 kadin (shimmer), 4 olgun erkek (onyx), 5 yasli erkek (onyx, 0.95x)
+      const voiceConfig = (aiLevel === 3)
+        ? { voice: 'shimmer', speed: 1.0 }
+        : (aiLevel === 5)
+        ? { voice: 'onyx', speed: 0.95 }
+        : (aiLevel === 4)
+        ? { voice: 'onyx', speed: 1.0 }
+        : { voice: 'echo', speed: 1.0 };
+
       const speakRes = await axios.post(`${AI_SERVICE_INTERNAL_URL}/speak`, {
         text: answer,
         format: 'mp3',
+        voice: voiceConfig.voice,
+        speed: voiceConfig.speed,
       }, { timeout: 30000, responseType: 'arraybuffer', headers: aiServiceHeaders() });
 
       if (peerState.stopped) return;
