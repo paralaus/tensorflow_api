@@ -102,20 +102,75 @@ def _headers() -> dict:
     return {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
 
 
+# CORE ARA SIRA 500 DONUYOR VE BU GECICI.
+#
+# Olculdu: ayni sorgu ust uste ucunde 200 donerken bir baskasinda
+# {"message": "Idle timeout reached for ...search.windows.net..."} ile 500
+# donebiliyor - arkadaki Azure Search bazen yetismiyore. Yani 500 burada
+# "istek hatali" DEGIL, "tekrar dene" demek.
+#
+# Tekrar denemesiz hali bu boru hattini kumar haline getiriyordu: tek bir
+# gecici 500, butun psikoloji fetch'ini iptal ediyor, bootstrap
+# "core failed" yazip geciyor ve corpus bir sonraki gune kadar bos kaliyor.
+CORE_RETRIES = int(os.environ.get("CORE_FETCH_RETRIES", "4"))
+CORE_RETRY_BACKOFF_SEC = float(os.environ.get("CORE_FETCH_RETRY_BACKOFF_SEC", "5"))
+
+
+def _error_message(resp) -> str:
+    """Yanit govdesinden okunabilir hata metnini cikarir.
+
+    NEDEN: eskiden yalnizca raise_for_status()'un tek satiri loglaniyordu
+    ("500 Server Error ... for url: ...") ve bu, GECICI bir zaman asimi ile
+    HATALI SORGU sozdizimini ayirt edilemez kiliyordu. Ikisi de 500 donuyor;
+    fark sadece govdede. Bu yuzden language.name hatasi uzun sure
+    "CORE bozuk" sanildi.
+    """
+    try:
+        data = resp.json() or {}
+        msg = data.get("message") or data.get("error") or ""
+        if msg:
+            return str(msg)[:200]
+    except Exception:
+        pass
+    return (resp.text or "")[:200]
+
+
 def search(query: str, *, offset: int, limit: int) -> dict[str, Any]:
-    """CORE v3 /search/works cagrisi. Hata -> exception (caller yakalar)."""
-    resp = requests.get(
-        f"{API_BASE_URL}/search/works",
-        params={"q": query, "offset": offset, "limit": limit},
-        headers=_headers(),
-        timeout=HTTP_TIMEOUT,
-    )
-    if resp.status_code == 401:
-        raise RuntimeError("CORE API 401 Unauthorized - CORE_API_KEY eksik/gecersiz.")
-    if resp.status_code == 429:
-        raise RuntimeError("CORE API 429 Too Many Requests - CORE_FETCH_DELAY_SEC'i artir.")
-    resp.raise_for_status()
-    return resp.json()
+    """CORE v3 /search/works cagrisi. Gecici hatalarda tekrar dener."""
+    last_detail = ""
+    for attempt in range(1, CORE_RETRIES + 1):
+        try:
+            resp = requests.get(
+                f"{API_BASE_URL}/search/works",
+                params={"q": query, "offset": offset, "limit": limit},
+                headers=_headers(),
+                timeout=HTTP_TIMEOUT,
+            )
+        except requests.RequestException as e:
+            last_detail = f"baglanti: {str(e)[:150]}"
+        else:
+            # Bunlar tekrar denemekle duzelmez - hemen bildir.
+            if resp.status_code == 401:
+                raise RuntimeError("CORE API 401 Unauthorized - CORE_API_KEY eksik/gecersiz.")
+            if resp.status_code == 429:
+                raise RuntimeError(
+                    "CORE API 429 Too Many Requests - CORE_FETCH_DELAY_SEC'i artir."
+                )
+            if resp.status_code < 400:
+                return resp.json()
+
+            last_detail = f"HTTP {resp.status_code}: {_error_message(resp)}"
+            # 4xx (429 haric) bizim sorgumuzun hatasi; tekrar denemek bosuna.
+            if 400 <= resp.status_code < 500:
+                raise RuntimeError(f"CORE API {last_detail}")
+
+        if attempt < CORE_RETRIES:
+            wait = CORE_RETRY_BACKOFF_SEC * attempt
+            print(f"[core_fetch] {last_detail} (deneme {attempt}/{CORE_RETRIES}); "
+                  f"{wait:.0f}s sonra tekrar.")
+            time.sleep(wait)
+
+    raise RuntimeError(f"CORE API {CORE_RETRIES} denemede basarisiz - {last_detail}")
 
 
 def _parse_response(data: dict[str, Any]) -> tuple[list[dict], int]:
