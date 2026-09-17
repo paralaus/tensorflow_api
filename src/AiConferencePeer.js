@@ -59,6 +59,45 @@ const TMP_DIR = process.env.AI_PEER_TMP_DIR || path.join(os.tmpdir(), 'ai-confer
 // server-to-server calls keep working.
 const AI_PEER_API_KEY = process.env.AI_PEER_API_KEY || '';
 
+/**
+ * Seviye -> TTS sesi ve hizi. AI Psikolog seviye atladikca yasleniyor, ses
+ * de onunla birlikte koyulasiyor:
+ *
+ *   1 PsyAtlas Ogrenci           genc erkek    alloy
+ *   2 PsyAtlas Arastirmaci       genc erkek    fable
+ *   3 PsyAtlas Danisman          KADIN         shimmer
+ *   4 PsyAtlas Kidemli Danisman  olgun erkek   echo
+ *   5 PsyAtlas Bas Danisman      yasli erkek   onyx, %8 yavas
+ *
+ * Bes seviye, BES AYRI ses. Eskiden 1 ile 2 birebir ayni ('echo'), 4 ile 5
+ * ise yalnizca %5 hiz farkliydi - dort erkek seviye iki sese dusuyor ve
+ * yaslanma duyulmuyordu.
+ *
+ * Seviye 3'un kadin olmasi mobile'daki avatarGenderForLevel ile bagli:
+ * o seviyede ai_avatar_3.riv (kadin yuz) ciziliyor. Bu satiri degistiren
+ * avatarin cinsiyetiyle sesi ayirir.
+ *
+ * DIKKAT - bu tablonun birebir ayni kopyalari:
+ *   mobile           src/types/aiAvatar.ts              -> avatarVoiceForLevel
+ *   tensorflow_api   app.py                             -> _TTS_LEVEL_VOICES
+ *   terapi_ai/server src/utils/aiPsychologistLevels.js  -> LEVELS
+ * Birini degistiren HEPSINI degistirmeli.
+ */
+const LEVEL_VOICES = {
+  1: { voice: process.env.AI_PEER_VOICE_LVL1 || 'alloy', speed: 1.0 },
+  2: { voice: process.env.AI_PEER_VOICE_LVL2 || 'fable', speed: 1.0 },
+  3: { voice: process.env.AI_PEER_VOICE_LVL3 || 'shimmer', speed: 1.0 },
+  4: { voice: process.env.AI_PEER_VOICE_LVL4 || 'echo', speed: 1.0 },
+  5: { voice: process.env.AI_PEER_VOICE_LVL5 || 'onyx', speed: 0.92 },
+};
+
+/** Seviyeyi 1..5'e kirpar - deger /ai-psychologist uzerinden aga acik. */
+function clampLevel(value) {
+  const level = Math.round(Number(value));
+  if (!Number.isFinite(level)) return 1;
+  return Math.min(5, Math.max(1, level));
+}
+
 function aiServiceHeaders(extra) {
   const headers = { ...extra };
   if (AI_PEER_API_KEY) headers['X-API-Key'] = AI_PEER_API_KEY;
@@ -701,7 +740,7 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
         }, { timeout: 30000, headers: { Authorization: `Bearer ${peerState.authToken}` } });
         answer = (chatRes.data && chatRes.data.answer || '').trim();
         if (chatRes.data && chatRes.data.level) {
-          peerState.level = chatRes.data.level;
+          peerState.level = clampLevel(chatRes.data.level);
           peerState.levelName = chatRes.data.levelName || peerState.levelName;
         }
       } else {
@@ -724,17 +763,10 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
       }
       log.info(`[${roomId}] cevap: "${answer.slice(0, 120)}"`);
 
-      const aiLevel = (chatRes && chatRes.data && chatRes.data.level) || peerState.level || 1;
+      const aiLevel = clampLevel((chatRes && chatRes.data && chatRes.data.level) || peerState.level);
       peerState.level = aiLevel;
-      // Seviye ve yasa gore ses: 1-2 genc erkek (echo), 3 kadin (shimmer), 4 olgun erkek (onyx), 5 yasli erkek (onyx, 0.95x)
-      const voiceConfig = (aiLevel === 3)
-        ? { voice: 'shimmer', speed: 1.0 }
-        : (aiLevel === 5)
-        ? { voice: 'onyx', speed: 0.95 }
-        : (aiLevel === 4)
-        ? { voice: 'onyx', speed: 1.0 }
-        : { voice: 'echo', speed: 1.0 };
-      log.info(`[${roomId}] ses sentezleniyor (seviye: ${aiLevel}, ses: ${voiceConfig.voice})...`);
+      const voiceConfig = LEVEL_VOICES[aiLevel];
+      log.info(`[${roomId}] ses sentezleniyor (seviye: ${aiLevel}, ses: ${voiceConfig.voice}, hiz: ${voiceConfig.speed})...`);
 
       const speakRes = await axios.post(`${AI_SERVICE_INTERNAL_URL}/speak`, {
         text: answer,
@@ -851,7 +883,7 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
           headers: { Authorization: `Bearer ${authToken}` },
         });
         if (histRes.data && histRes.data.level) {
-          initialLevel = histRes.data.level;
+          initialLevel = clampLevel(histRes.data.level);
           initialLevelName = histRes.data.levelName || initialLevelName;
         }
       } catch (e) {
