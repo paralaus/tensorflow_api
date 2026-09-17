@@ -57,6 +57,11 @@ PAGE_SIZE = int(os.environ.get("CORE_FETCH_PAGE_SIZE", "20"))
 # CORE'un dokumante edilen rate limiti dusuk (tekli aramalar icin 10sn'de
 # birkac istek) - varsayilan gecikme temkinli tutuldu.
 REQUEST_DELAY_SEC = float(os.environ.get("CORE_FETCH_DELAY_SEC", "2.0"))
+# Konular arasi bekleme. Sayfa ARASI beklemeden ayri: 18 konu arka arkaya
+# kosunca CORE'un hiz limiti ucuncu konuda doluyordu.
+TOPIC_DELAY_SEC = float(os.environ.get("CORE_FETCH_TOPIC_DELAY_SEC", "10"))
+# 429 sonrasi beklenecek sure (deneme basina katlanarak artar).
+RATE_LIMIT_WAIT_SEC = float(os.environ.get("CORE_FETCH_RATE_WAIT_SEC", "30"))
 # Gercek testte CORE'un arama sorgulari (ozellikle coklu OR terimli
 # sorgular) tek sayfa icin bile 45-60sn surebiliyor - varsayilani buna
 # gore comert tuttuk, aksi halde varsayilan ayarlarla her calistirma
@@ -222,8 +227,25 @@ def search(query: str, *, offset: int, limit: int) -> dict[str, Any]:
             if resp.status_code == 401:
                 raise RuntimeError("CORE API 401 Unauthorized - CORE_API_KEY eksik/gecersiz.")
             if resp.status_code == 429:
+                # 429 KALICI DEGIL, "bekle ve tekrar dene" demek.
+                #
+                # Eskiden burada hemen exception atiliyordu ve bu, konu
+                # listesiyle birlikte kotu bir etkilesim uretiyordu: limit
+                # ucuncu konuda dolunca kalan 15 konu HIC BEKLEMEDEN pes
+                # pese dusuyordu. Tek bir sorgu icin makul olan davranis,
+                # 18 sorgunun ardi ardina kostugu yerde cekimi bastan
+                # sakatliyordu. Diger gecici hatalardan daha uzun
+                # bekliyoruz: CORE'un limiti zaman pencereli.
+                last_detail = "HTTP 429 Too Many Requests"
+                if attempt < CORE_RETRIES:
+                    wait = RATE_LIMIT_WAIT_SEC * attempt
+                    print(f"[core_fetch] hiz limiti (deneme {attempt}/{CORE_RETRIES}); "
+                          f"{wait:.0f}s bekleniyor.")
+                    time.sleep(wait)
+                    continue
                 raise RuntimeError(
-                    "CORE API 429 Too Many Requests - CORE_FETCH_DELAY_SEC'i artir."
+                    "CORE API 429 Too Many Requests - CORE_FETCH_DELAY_SEC ya da "
+                    "CORE_FETCH_TOPIC_DELAY_SEC'i artir."
                 )
             if resp.status_code < 400:
                 return resp.json()
@@ -388,10 +410,14 @@ def main(argv: Optional[list] = None) -> int:
             # aksilik corpus'un tamamini gunceltmeden birakiyor.
             failed += 1
             print(f"[core_fetch] konu basarisiz ({label}): {e}", file=sys.stderr)
+            if idx < len(queries) and TOPIC_DELAY_SEC > 0:
+                time.sleep(TOPIC_DELAY_SEC)
             continue
         for k in total:
             total[k] += summary.get(k, 0)
         print(f"[core_fetch]   -> {summary}")
+        if idx < len(queries) and TOPIC_DELAY_SEC > 0:
+            time.sleep(TOPIC_DELAY_SEC)
 
     total["topics"] = len(queries)
     total["failed_topics"] = failed
