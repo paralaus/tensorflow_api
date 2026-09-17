@@ -159,7 +159,11 @@ def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
     hem modele yarim cumle veriyor hem de embedding kalitesini dusuruyor:
     bas ve son parcalar anlamsiz token dizileri oluyor.
     """
-    text = re.sub(r"[ \t]+", " ", text or "")
+    # Once satir sonlarini tekillestir: kaynak .txt dosyalari CRLF ve
+    # yalniz-CR karisik geliyor. Temizlenmezse \r chunk'in icinde
+    # kalip hem prompt'a hem de loglara sizar.
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if not text:
         return []
