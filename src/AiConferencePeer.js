@@ -121,6 +121,14 @@ const MIN_TURN_SEC = 0.6;
 // Hard cap so a stuck/very long monologue doesn't record forever.
 const MAX_TURN_SEC = 25;
 
+// ffmpeg'in CIKMASI ile kullanicinin sesin sonunu DUYMASI ayni an degil:
+// arada mediasoup ve client'in jitter buffer'i var (~150-250ms), ustune
+// client cizelgeyi DEFAULT_LEAD_MS=200 kadar geciktirerek basliyor.
+// Hemen 'listening'e gecmek client'a ayni zamanda "agzi kapat" sinyali
+// oldugu icin (bkz. mobile useAiVisemePlayer) agiz cumlenin son
+// hecelerinde donuyordu. Bu kadar bekleyip oyle geciyoruz.
+const SPEAK_TAIL_MS = parseInt(process.env.AI_PEER_SPEAK_TAIL_MS || '400', 10);
+
 // Eski sunucu-tarafi VP8 avatar yolunu geri acar (bkz. dosya basindaki
 // "KONUSAN AVATAR" notu). Varsayilan KAPALI: viseme metadata'si tek basina
 // yeterli ve ucuz. Sadece guncellenmemis mobil surumler icin yayin
@@ -690,8 +698,14 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
       fs.promises.unlink(inputPath).catch(() => {});
       // Konusma bitti: 'listening'e donmek client'a ayni zamanda "agzi
       // kapat" sinyali veriyor, cizelge kisa/yanlis kalsa bile avatar
-      // acik agizda takili kalmiyor.
-      if (!peerState.stopped) setPeerState(peerState, 'listening');
+      // acik agizda takili kalmiyor. Ama HEMEN degil - ses hala yolda
+      // (bkz. SPEAK_TAIL_MS), yoksa agiz son hecelerde donuyor.
+      if (!peerState.stopped) {
+        if (SPEAK_TAIL_MS > 0) {
+          await new Promise((resolve) => setTimeout(resolve, SPEAK_TAIL_MS));
+        }
+        if (!peerState.stopped) setPeerState(peerState, 'listening');
+      }
     }
   }
 
@@ -797,9 +811,19 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
   // ---------------------------------------------------------------------
   function startListenTurn(peerState) {
     if (peerState.stopped) return;
-    if (peerState.state === 'speaking' || peerState.state === 'thinking' || peerState.state === 'transcribing') {
+    if (
+      // `turnInFlight` DURUMDAN AYRI bir bayrak olmak zorunda: handleTurn
+      // async ve ilk ifadesi bir await, yani 'transcribing'e gecmeden ONCE
+      // kontrolu geri veriyor. Yalnizca duruma bakan bir korumayi bu
+      // yuzden es geciyordu - ayrinti icin asagidaki close dinleyicisi.
+      peerState.turnInFlight ||
+      peerState.state === 'speaking' ||
+      peerState.state === 'thinking' ||
+      peerState.state === 'transcribing'
+    ) {
       // Don't start listening for a new turn while we're mid-response;
       // re-check shortly. Keeps us from racing our own reply.
+      if (peerState.listenRetryTimer) clearTimeout(peerState.listenRetryTimer);
       peerState.listenRetryTimer = setTimeout(() => startListenTurn(peerState), 500);
       return;
     }
@@ -842,11 +866,42 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
         fs.promises.unlink(wavPath).catch(() => {});
         return;
       }
-      handleTurn(peerState, wavPath).catch((e) => log.error(`[${peerState.roomId}] handleTurn: ${e.message}`));
-      // Next turn's receiver starts once this one has fully closed - the
-      // mediasoup consumer itself never stops, so no RTP is lost between
-      // receivers beyond the brief process-spawn gap.
-      startListenTurn(peerState);
+      /*
+       * SIRA ONEMLI - AVATARIN KONUSMA ORTASINDA "DINLIYOR"A DUSMESI.
+       *
+       * Burada eskiden handleTurn ates-unut cagriliyor, hemen ardindan
+       * startListenTurn SENKRON olarak calisiyordu. handleTurn async ve
+       * ilk ifadesi `await fs.promises.stat(...)`, yani 'transcribing'e
+       * gecmeden once kontrolu geri veriyor: startListenTurn durumu hala
+       * 'listening' goruyor, korumasi gecerli olmasina ragmen devreye
+       * girmiyor ve YENI BIR KAYDEDICI baslatiyordu.
+       *
+       * Sonucu: AI konusurken odayi dinleyen ikinci bir ffmpeg calisiyor.
+       * Televizyon/ortam sesi gibi mikrofona giren her sey bir "tur" gibi
+       * bolumleniyor, kaydedici kapaninca handleTurn tetikleniyor ve
+       * durum 'speaking' iken once 'transcribing' (client'ta "dusunuyor"),
+       * transkripsiyon bos cikinca da 'listening' oluyordu. Client
+       * 'speaking' disindaki her durumda cizelgeyi dusurdugu icin
+       * (useTherapyConference) AGIZ CUMLENIN ORTASINDA DONUYOR, ses ise
+       * bagimsiz RTP akisi oldugu icin sonuna kadar devam ediyordu. Ayni
+       * yol iki handleTurn'un ust uste binmesine ve AI'in kendi
+       * cevabini tetiklemesine de acikti.
+       *
+       * Bayrak SENKRON olarak burada kalkiyor, dolayisiyla sirada bekleyen
+       * hicbir startListenTurn onu kacirmiyor. Bedeli: AI konusurken
+       * kullanicinin sozunu kesmesi (barge-in) kaydedilmiyor - zaten
+       * korumanin en basindaki niyet buydu.
+       */
+      peerState.turnInFlight = true;
+      handleTurn(peerState, wavPath)
+        .catch((e) => log.error(`[${peerState.roomId}] handleTurn: ${e.message}`))
+        .finally(() => {
+          peerState.turnInFlight = false;
+          // Tur bittiginde durum zaten 'listening' (speak()'in finally'si),
+          // yani yeni kaydedici 500ms'lik yeniden deneme turuna girmeden
+          // dogrudan basliyor.
+          startListenTurn(peerState);
+        });
     });
     ff.on('error', (e) => {
       log.error(`[${peerState.roomId}] listen ffmpeg error: ${e.message}`);
@@ -913,6 +968,9 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
       authToken: authToken || '',
       listenProcess: null,
       listenRetryTimer: null,
+      // Bir tur (transkripsiyon -> LLM -> TTS -> konusma) su an isliyor mu.
+      // Durumdan ayri tutulmasinin sebebi: bkz. startListenTurn korumasi.
+      turnInFlight: false,
     };
 
     // --- Listen transport: mirrors the live-HLS PlainTransport.consume()
