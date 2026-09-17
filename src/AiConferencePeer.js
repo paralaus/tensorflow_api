@@ -63,15 +63,20 @@ const AI_PEER_API_KEY = process.env.AI_PEER_API_KEY || '';
  * Seviye -> TTS sesi ve hizi. AI Psikolog seviye atladikca yasleniyor, ses
  * de onunla birlikte koyulasiyor:
  *
- *   1 PsyAtlas Ogrenci           genc erkek    alloy
- *   2 PsyAtlas Arastirmaci       genc erkek    fable
+ *   1 PsyAtlas Ogrenci           genc erkek    ash
+ *   2 PsyAtlas Arastirmaci       genc erkek    verse
  *   3 PsyAtlas Danisman          KADIN         shimmer
  *   4 PsyAtlas Kidemli Danisman  olgun erkek   echo
- *   5 PsyAtlas Bas Danisman      yasli erkek   onyx, %8 yavas
+ *   5 PsyAtlas Bas Danisman      yasli erkek   onyx
  *
- * Bes seviye, BES AYRI ses. Eskiden 1 ile 2 birebir ayni ('echo'), 4 ile 5
- * ise yalnizca %5 hiz farkliydi - dort erkek seviye iki sese dusuyor ve
- * yaslanma duyulmuyordu.
+ * Bes seviye, BES AYRI ses - ve dort erkek seviyenin dordu de CINSIYETI
+ * TARTISMASIZ bir ses kullaniyor. Ikinci sart onemli: eski tts-1 setinin
+ * alti sesinden yalnizca 'echo' ile 'onyx' net erkek, 'alloy' ile 'fable'
+ * androjen. 'fable' seviye 2'de sahada KADIN olarak duyuldu. 'ash' ve
+ * 'verse' gpt-4o-mini-tts setinden geliyor (bkz. app.py OPENAI_TTS_MODEL).
+ *
+ * Hiz sutunu artik hep 1.0: merdiven bes AYRI sese dayaniyor, hiza degil -
+ * ustelik gpt-4o-mini-tts 'speed' parametresini kabul etmiyor.
  *
  * Seviye 3'un kadin olmasi mobile'daki avatarGenderForLevel ile bagli:
  * o seviyede ai_avatar_3.riv (kadin yuz) ciziliyor. Bu satiri degistiren
@@ -84,11 +89,11 @@ const AI_PEER_API_KEY = process.env.AI_PEER_API_KEY || '';
  * Birini degistiren HEPSINI degistirmeli.
  */
 const LEVEL_VOICES = {
-  1: { voice: process.env.AI_PEER_VOICE_LVL1 || 'alloy', speed: 1.0 },
-  2: { voice: process.env.AI_PEER_VOICE_LVL2 || 'fable', speed: 1.0 },
+  1: { voice: process.env.AI_PEER_VOICE_LVL1 || 'ash', speed: 1.0 },
+  2: { voice: process.env.AI_PEER_VOICE_LVL2 || 'verse', speed: 1.0 },
   3: { voice: process.env.AI_PEER_VOICE_LVL3 || 'shimmer', speed: 1.0 },
   4: { voice: process.env.AI_PEER_VOICE_LVL4 || 'echo', speed: 1.0 },
-  5: { voice: process.env.AI_PEER_VOICE_LVL5 || 'onyx', speed: 0.92 },
+  5: { voice: process.env.AI_PEER_VOICE_LVL5 || 'onyx', speed: 1.0 },
 };
 
 /** Seviyeyi 1..5'e kirpar - deger /ai-psychologist uzerinden aga acik. */
