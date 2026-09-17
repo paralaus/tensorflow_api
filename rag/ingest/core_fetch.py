@@ -115,6 +115,27 @@ DEFAULT_QUERY = (
 
 LANG_FILTER = os.environ.get("CORE_FETCH_LANG", "language.code:tr")
 
+# DISIPLIN CAPASI - her konu sorgusuna eklenir.
+#
+# CORE butun disiplinleri indeksliyor ve konu kelimelerimizin cogu ayni
+# zamanda gundelik kelime: "uyku", "madde", "kayip", "iliski", "yeme".
+# Capasiz sorgu bunlarin gectigi her tezi cekiyor. Sahada goruldu:
+# "surekli kaygi + uyku" sorgusuna donen kayit, bir TURIZM ISLETMECILIGI
+# tezinden geliyordu (yiyecek icecek isletmelerinde uyku yoksunlugunun is
+# memnuniyetine etkisi) - pasajin kendisi iyiydi ama corpus'un alani
+# kaymisti.
+#
+# Olculdu (uyku konusu): capasiz 606 kayit, ilk sonuclar turizm ve dijital
+# oyun bagimliligi; capali 63 kayit, ilk sonuclar "insomnia severity and
+# mindfulness", "uyku hijyeni egitimi", "ACT temelli basa cikma".
+# DIKKAT: bu olcum TEK konuda yapildi; anksiyete karsilastirmasi CORE'un
+# hiz limitine takildi. Hacim belirgin dusuyor - bos string ile kapatilip
+# yeniden olculebilir.
+DOMAIN_ANCHOR = os.environ.get(
+    "CORE_FETCH_DOMAIN_ANCHOR",
+    "(psikoloji OR psikiyatri OR psikoterapi OR danışmanlık OR ruhsal)",
+).strip()
+
 # KONU LISTESI - tek genis sorgu yerine hedefli cekimler.
 #
 # NEDEN: tek bir genis sorgu, CORE'un alaka siralamasina gore ilk N kaydi
@@ -373,10 +394,17 @@ def fetch(query: str, *, limit: int, dry_run: bool = False) -> dict[str, Any]:
 
 
 def _with_lang(query: str) -> str:
-    """Konu sorgusuna dil filtresini ekler (zaten varsa dokunmaz)."""
-    if not LANG_FILTER or LANG_FILTER in query:
-        return query
-    return f"{query} AND {LANG_FILTER}"
+    """Konu sorgusuna disiplin capasini ve dil filtresini ekler.
+
+    Ikisi de 'zaten varsa dokunma' mantigiyla calisiyor, boylece elle
+    yazilmis --query sorgulari bozulmuyor.
+    """
+    out = query
+    if DOMAIN_ANCHOR and DOMAIN_ANCHOR not in out:
+        out = f"{out} AND {DOMAIN_ANCHOR}"
+    if LANG_FILTER and LANG_FILTER not in out:
+        out = f"{out} AND {LANG_FILTER}"
+    return out
 
 
 def main(argv: Optional[list] = None) -> int:
