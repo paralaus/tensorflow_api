@@ -58,6 +58,7 @@ const TMP_DIR = process.env.AI_PEER_TMP_DIR || path.join(os.tmpdir(), 'ai-confer
 // configured, set AI_PEER_API_KEY to one of those keys so these internal
 // server-to-server calls keep working.
 const AI_PEER_API_KEY = process.env.AI_PEER_API_KEY || '';
+
 function aiServiceHeaders(extra) {
   const headers = { ...extra };
   if (AI_PEER_API_KEY) headers['X-API-Key'] = AI_PEER_API_KEY;
@@ -370,6 +371,12 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
   const log = {
     info: logInfo || ((...a) => console.log('[ai-peer]', ...a)),
     error: logError || ((...a) => console.error('[ai-peer]', ...a)),
+    // Olumcul olmayan uyarilar. Server.js sadece logInfo/logError geciyor,
+    // bu yuzden warn'i info'ya dusuruyoruz: burada eksik bir yontem
+    // cagrildiginda hata CATCH BLOGUNUN ICINDE atilir ve asil hatanin
+    // yerine gecer - baslangic seviyesi alinamadiginda AI peer'in odaya
+    // hic katilamamasinin sebebi tam olarak buydu.
+    warn: (...a) => (logInfo || ((...b) => console.warn('[ai-peer]', ...b)))(...a),
   };
 
   fs.mkdirSync(TMP_DIR, { recursive: true });
@@ -489,6 +496,8 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
       userId: 'ai-peer',
       socketId: peerState.fakeSocketId,
       state: clientState,
+      level: peerState.level || 1,
+      levelName: peerState.levelName || 'PsyAtlas Ogrenci',
     });
   }
 
@@ -691,6 +700,10 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
           ...(emotionHint ? { emotionHint } : {}),
         }, { timeout: 30000, headers: { Authorization: `Bearer ${peerState.authToken}` } });
         answer = (chatRes.data && chatRes.data.answer || '').trim();
+        if (chatRes.data && chatRes.data.level) {
+          peerState.level = chatRes.data.level;
+          peerState.levelName = chatRes.data.levelName || peerState.levelName;
+        }
       } else {
         // authToken yoksa (eski/kimliksiz cagri) eski davranisa geri don:
         // tensorflow_api'nin kendi /psychology/chat'i, sadece bu gorusme
@@ -721,6 +734,7 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
         : (aiLevel === 4)
         ? { voice: 'onyx', speed: 1.0 }
         : { voice: 'echo', speed: 1.0 };
+      log.info(`[${roomId}] ses sentezleniyor (seviye: ${aiLevel}, ses: ${voiceConfig.voice})...`);
 
       const speakRes = await axios.post(`${AI_SERVICE_INTERNAL_URL}/speak`, {
         text: answer,
@@ -828,12 +842,31 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
     if (!humanProducer) throw new Error('no_human_audio_producer_in_room');
     const router = room.router;
 
+    let initialLevel = 1;
+    let initialLevelName = 'PsyAtlas Ogrenci';
+    if (authToken) {
+      try {
+        const histRes = await axios.get(`${TERAPI_AI_BACKEND_URL}/ai-psychologist/history`, {
+          timeout: 5000,
+          headers: { Authorization: `Bearer ${authToken}` },
+        });
+        if (histRes.data && histRes.data.level) {
+          initialLevel = histRes.data.level;
+          initialLevelName = histRes.data.levelName || initialLevelName;
+        }
+      } catch (e) {
+        log.warn(`[${roomId}] baslangic seviyesi alinamadi (1 varsayiliyor): ${e.message}`);
+      }
+    }
+
     const fakeSocketId = `ai-peer-${crypto.randomUUID()}`;
     const peerState = {
       roomId,
       room,
       fakeSocketId,
       state: 'idle',
+      level: initialLevel,
+      levelName: initialLevelName,
       // setPeerState'in tekrarli olay gondermesini engelleyen son duyurulan
       // client durumu; 'idle' baslangicta duyurulmadi, ilk gercek gecis
       // (listening) gonderilecek.
@@ -960,6 +993,15 @@ module.exports = function initAiConferencePeer(io, { rooms, logInfo, logError })
     // produce() broadcast, using conferenceNsp since we have no real socket
     // to call socket.to() from).
     announceAiProducer(roomId, speak0.producer, fakeSocketId);
+
+    conferenceNsp.to(roomId).emit('ai:avatar-state', {
+      roomId,
+      userId: 'ai-peer',
+      socketId: fakeSocketId,
+      state: 'idle',
+      level: initialLevel,
+      levelName: initialLevelName,
+    });
 
     activePeers.set(roomId, peerState);
     log.info(`[${roomId}] AI peer odaya katildi (listenPort=${listenPort}, speakPort=${peerState.speakPort})`);
