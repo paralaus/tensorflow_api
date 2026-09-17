@@ -53,6 +53,11 @@ _COOLDOWN_SEC = float(os.environ.get("RAG_EMBED_COOLDOWN_SEC", "30"))
 _fail_count = 0
 _cooldown_until = 0.0
 
+# Remote saglayicinin ILK acilis probu basarisiz olursa ne kadar sonra
+# tekrar denenecegi (bkz. _ensure_loaded icindeki not).
+_INIT_RETRY_SEC = float(os.environ.get("RAG_EMBED_INIT_RETRY_SEC", "120"))
+_init_retry_after = 0.0
+
 _model = None
 _dim: Optional[int] = None
 _lock = threading.Lock()
@@ -61,7 +66,7 @@ _LOAD_ATTEMPTED = False
 
 
 def _ensure_loaded():
-    global _model, _dim, _DISABLED, _LOAD_ATTEMPTED
+    global _model, _dim, _DISABLED, _LOAD_ATTEMPTED, _init_retry_after
     if _model is not None or _DISABLED:
         return
     with _lock:
@@ -72,7 +77,10 @@ def _ensure_loaded():
         if PROVIDER == "digitalocean":
             if not _DO_KEY:
                 print("[rag/embedder] DIGITALOCEAN_API_KEY yok, remote embedding devre disi.")
-                _DISABLED = True
+                _DISABLED = True  # anahtar yoksa beklemenin anlami yok, bu gercekten kalici
+                return
+            import time as _time
+            if _init_retry_after and _time.time() < _init_retry_after:
                 return
             try:
                 # Boyut algilamak icin tek seferlik prob istegi.
@@ -81,10 +89,22 @@ def _ensure_loaded():
                     raise RuntimeError("empty response")
                 _dim = len(vec[0])
                 _model = "digitalocean"  # sentinel; lookup'larda is_ready() icin
+                _init_retry_after = 0.0
                 print(f"[rag/embedder] DigitalOcean remote OK (model={MODEL_NAME}, dim={_dim})")
             except Exception as e:
-                print(f"[rag/embedder] DigitalOcean init hata: {e}")
-                _DISABLED = True
+                # KALICI OLARAK KAPATMIYORUZ. Eskiden burada _DISABLED = True
+                # vardi ve bedeli agirdi: acilis aninda saglayici bir saniye
+                # bile cevap vermezse (kota, 402, gecici ag hatasi) RAG O
+                # SUREC BOYUNCA olu kaliyordu. Saglayici bes dakika sonra
+                # duzelse bile kendiliginden toparlanmiyor, birinin
+                # `systemctl restart tensorflow-api` demesi gerekiyordu - ve
+                # hicbir katman hata uretmedigi icin kimse fark etmiyordu.
+                # Artik bir sure bekleyip tekrar deniyoruz.
+                _init_retry_after = _time.time() + _INIT_RETRY_SEC
+                print(
+                    f"[rag/embedder] DigitalOcean init hata: {e} "
+                    f"({_INIT_RETRY_SEC:.0f}s sonra tekrar denenecek)"
+                )
             return
 
         # PROVIDER == "local"
