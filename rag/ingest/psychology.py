@@ -76,20 +76,130 @@ def extract_text(path: Path) -> str:
 
 # ---------------- Chunk ----------------
 
+# Anlamsiz chunk'lari indekse hic sokmamak icin esikler.
+#
+# NEDEN GEREKLI: CORE bircok kayit icin tam metin donduruyor, yani 300
+# sayfalik tezler de corpus'a giriyor. Bir tezin govdesi kadar EKLERI de
+# indeksleniyordu: Beck Depresyon Olcegi maddeleri, kaynakca listeleri,
+# tablo doküntüleri, icindekiler. Bunlar konu kelimeleri tasidigi icin
+# benzerlik yarisini KAZANIYOR ama bilgi tasimiyor.
+#
+# Sahada goruldu: "surekli kaygi hissediyorum" sorusuna donen context,
+# bir tezin ekindeki olcek maddeleriydi ("0 Dis gorunusumun eskisinden
+# daha kotu oldugunu sanmiyorum  1 Yaslandigimi ve cekiciligimi
+# kaybettigimi dusunuyorum ..."). Boyle bir metni modele baglam diye
+# vermek hicbir sey vermemekten kotu: model zor durumdaki kullaniciya
+# olcek maddesi tekrarlayabilir.
+CHUNK_MIN_CHARS = int(os.environ.get("PSYCH_CHUNK_MIN_CHARS", "300"))
+# Rakam yogunlugu: olcek maddeleri ve tablolar rakamla dolu, duz metin degil.
+CHUNK_MAX_DIGIT_RATIO = float(os.environ.get("PSYCH_CHUNK_MAX_DIGIT_RATIO", "0.12"))
+# Kelime cesitliligi: icindekiler/kaynakca ayni kaliplari tekrarlar.
+CHUNK_MIN_UNIQUE_WORD_RATIO = float(os.environ.get("PSYCH_CHUNK_MIN_UNIQUE_RATIO", "0.45"))
+# Bir chunk icinde bu kadar cok "satir basi rakam" varsa madde listesidir.
+CHUNK_MAX_NUMBERED_LINES = int(os.environ.get("PSYCH_CHUNK_MAX_NUMBERED_LINES", "4"))
+# Tek basina duran kucuk sayilarin ust siniri.
+#
+# Likert/olcek maddelerinin parmak izi bu: "0 Kendimi uzgun hissetmiyorum
+# 1 Kendimi uzgun hissediyorum 2 ... 3 ...". Rakam YOGUNLUGU (karakter
+# orani) bunu yakalamiyor, cunku maddelerin metni uzun - bir tez ekindeki
+# olcek sayfasi karakterlerin yalnizca %2'si rakam oldugu halde bilgi
+# tasimiyor. Ayirt edici olan, tek basina duran sayilarin SAYISI.
+#
+# Esik 6: normal klinik metin de sayi kullaniyor ("240 katilimci",
+# "12 haftalik program", "3 olcum") ama bir chunk'ta nadiren altidan
+# fazlasi oluyor; olcek maddelerinde her madde en az dort tane getiriyor.
+CHUNK_MAX_BARE_NUMBERS = int(os.environ.get("PSYCH_CHUNK_MAX_BARE_NUMBERS", "6"))
+
+# Kaynakca satirlarinin parmak izi: yil parantezi, sayfa araligi, doi.
+_REFERENCE_RE = re.compile(r"\(\d{4}\)|\bdoi\s*:|\bss?\.\s*\d+\s*-\s*\d+", re.IGNORECASE)
+
+
+def looks_like_noise(chunk: str) -> bool:
+    """Bilgi tasimayan chunk'lari (olcek maddesi, kaynakca, tablo) eler."""
+    text = (chunk or "").strip()
+    if len(text) < CHUNK_MIN_CHARS:
+        return True
+
+    digits = sum(1 for c in text if c.isdigit())
+    if digits / len(text) > CHUNK_MAX_DIGIT_RATIO:
+        return True
+
+    words = re.findall(r"[^\W\d_]{2,}", text, flags=re.UNICODE)
+    if len(words) < 20:
+        return True
+    lowered = [w.lower() for w in words]
+    if len(set(lowered)) / len(lowered) < CHUNK_MIN_UNIQUE_WORD_RATIO:
+        return True
+
+    # Madde listeleri. Sayinin ardindan NOKTA/PARANTEZ SART ve satir basinda
+    # olmali: aksi halde "3 hafta icinde", "5 seans sonra" gibi normal klinik
+    # ifadeler madde sanilip gercek metin eleniyordu.
+    numbered = len(re.findall(r"(?:^|\n)\s*\d{1,2}[\.\)]\s*[^\W\d_]", text,
+                              flags=re.UNICODE | re.MULTILINE))
+    if numbered > CHUNK_MAX_NUMBERED_LINES:
+        return True
+
+    # Olcek/Likert maddeleri: tek basina duran kucuk sayilarin bollugu.
+    bare_numbers = len(re.findall(r"(?<![^\W\d_])\b\d{1,3}\b(?![^\W\d_])", text))
+    if bare_numbers > CHUNK_MAX_BARE_NUMBERS:
+        return True
+
+    # Kaynakca: cok sayida yil-parantezi / sayfa araligi / doi
+    if len(_REFERENCE_RE.findall(text)) >= 3:
+        return True
+
+    return False
+
+
 def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    """Metni parcalar. Kesim noktalari CUMLE/PARAGRAF sinirina cekilir.
+
+    Eskiden kesim ham karakter ofsetiyle yapiliyordu ve chunk'lar kelime
+    ortasinda basliyordu ("kiyorum  3 Artik hic karar veremiyorum..."). Bu
+    hem modele yarim cumle veriyor hem de embedding kalitesini dusuruyor:
+    bas ve son parcalar anlamsiz token dizileri oluyor.
+    """
     text = re.sub(r"[ \t]+", " ", text or "")
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if not text:
         return []
     if len(text) <= size:
         return [text]
+
     chunks: list[str] = []
     i = 0
-    while i < len(text):
-        chunks.append(text[i : i + size])
-        if i + size >= len(text):
+    n = len(text)
+    while i < n:
+        end = min(i + size, n)
+        if end < n:
+            # Pencerenin son %25'inde bir cumle/paragraf sonu ara.
+            window_start = i + int(size * 0.75)
+            cut = max(
+                text.rfind("\n\n", window_start, end),
+                text.rfind(". ", window_start, end),
+                text.rfind("! ", window_start, end),
+                text.rfind("? ", window_start, end),
+            )
+            if cut == -1:
+                cut = text.rfind(" ", window_start, end)  # hic degilse kelime sinirinda
+            if cut > i:
+                end = cut + 1
+        chunk = text[i:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= n:
             break
-        i += max(1, size - overlap)
+        # Bir sonraki parca ortusme kadar GERIDEN bassin.
+        #
+        # DIKKAT - burada `max(i + step, ...)` YAZMAK BOSLUK URETIYOR:
+        # cumle siniri arandigi icin `end` cogu zaman i+size'dan kucuk
+        # oluyor ve i+step o zaman `end`'in OTESINE dusuyor. Sonuc, hem
+        # ortusmenin kaybolmasi hem de aradaki metnin hic indekslenmemesi
+        # - ikisi de sessiz. Pencere boyu zaten `end` icinde kodlu, o
+        # yuzden tek dogru referans `end`.
+        nxt = max(i + 1, end - overlap)
+        space = text.rfind(" ", max(i + 1, nxt - 60), nxt)
+        i = (space + 1) if space > i else nxt
     return chunks
 
 
@@ -115,7 +225,7 @@ def make_docs(path: Path, source_dir: str) -> list[dict[str, Any]]:
 
     rel = str(path.relative_to(source_dir)).replace("\\", "/")
     title = path.stem
-    parts = chunk_text(text)
+    parts = [c for c in chunk_text(text) if not looks_like_noise(c)]
     file_hash = hashlib.sha1(rel.encode("utf-8")).hexdigest()[:10]
     out: list[dict[str, Any]] = []
     for i, part in enumerate(parts):
