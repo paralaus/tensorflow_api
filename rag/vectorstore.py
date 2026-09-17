@@ -160,8 +160,41 @@ def query(
             })
         return out
     except Exception as e:
-        print(f"[rag/vectorstore] query hata ({collection}): {e}")
+        # BOYUT UYUSMAZLIGINI AYRICA BAGIR. Embedding saglayicisi/modeli
+        # degistirildiginde (orn. Qwen3 1024 -> OpenAI 1536) eski vektorler
+        # yeni sorgularla uyumsuz olur. Chroma bunu istisna olarak firlatiyor,
+        # biz de her istisnayi yutup [] donduruyoruz - yani "koleksiyon yanlis
+        # modelle dolu" ile "alakali sonuc yok" birebir ayni goruntuyu
+        # veriyordu. Tek cozumu koleksiyonu sifirdan yeniden indekslemek, o
+        # yuzden ne yapilmasi gerektigini de yaziyoruz.
+        if "dimension" in str(e).lower():
+            print(f"[rag/vectorstore] BOYUT UYUSMAZLIGI ({collection}): {e}")
+            print("  Koleksiyon baska bir embedding modeliyle doldurulmus; "
+                  "yeniden indekslenene kadar RAG bos donecek.")
+            print("  Cozum: python -m rag.ingest.psychology "
+                  "rag/psychology_sources --reset")
+        else:
+            print(f"[rag/vectorstore] query hata ({collection}): {e}")
         return []
+
+
+def drop_collection(name: str) -> bool:
+    """Koleksiyonu tamamen siler.
+
+    Embedding modeli degisince gerekiyor: Chroma bir koleksiyonun vektor
+    boyutunu sonradan degistiremiyor, yeniden olusturmak sart.
+    """
+    _ensure_client()
+    if _DISABLED or _client is None:
+        return False
+    try:
+        _client.delete_collection(name)
+        _collections.pop(name, None)
+        print(f"[rag/vectorstore] '{name}' koleksiyonu silindi.")
+        return True
+    except Exception as e:
+        print(f"[rag/vectorstore] drop_collection hata ({name}): {e}")
+        return False
 
 
 def stats() -> dict:

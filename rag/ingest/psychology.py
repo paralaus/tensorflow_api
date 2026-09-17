@@ -191,7 +191,24 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="PDF/DOCX/TXT/MD dosyalarinin bulundugu klasor (default: rag/psychology_sources)",
     )
     p.add_argument("--dry-run", action="store_true", help="Embed/upsert yapma, sadece raporla")
+    p.add_argument(
+        "--reset", action="store_true",
+        help=(
+            "Once 'psychology' koleksiyonunu tamamen sil, sonra yeniden kur. "
+            "Embedding modeli/saglayicisi degistiginde ZORUNLU: Chroma bir "
+            "koleksiyonun vektor boyutunu sonradan degistiremiyor, eski "
+            "vektorler yeni sorgularla uyusmaz ve arama sessizce bos doner."
+        ),
+    )
     args = p.parse_args(argv)
+
+    if args.reset:
+        if args.dry_run:
+            print("[psych] --reset ile --dry-run birlikte kullanilamaz.")
+            return 2
+        from rag import vectorstore as _vs
+        # Koleksiyon hic yoksa da sorun degil; drop_collection False doner.
+        _vs.drop_collection(COLLECTION)
 
     summary = ingest(args.source_dir, dry_run=args.dry_run)
     print(f"[psych] sonuc: {summary}")

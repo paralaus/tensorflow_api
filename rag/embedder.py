@@ -24,22 +24,51 @@ from typing import Optional
 
 import requests
 
-# Provider secimi
+# Provider secimi. Varsayilan sira: OpenAI -> DigitalOcean -> local.
+#
+# OpenAI one alindi cunku DigitalOcean embeddings ucu hesap seviyesinde
+# 402 ("Payment Required / You are not allowed to perform this operation")
+# donuyordu ve bu RAG'i SESSIZCE olduruyordu: embed_query None doner,
+# retrieve() None doner, /psychology/chat literaturu hic eklemeden devam
+# eder. Teshis icin scripts/rag_psych_doctor.py.
 _DO_KEY = (os.environ.get("DIGITALOCEAN_API_KEY") or os.environ.get("DO_API_KEY") or "").strip()
-_DEFAULT_PROVIDER = "digitalocean" if _DO_KEY else "local"
+_OPENAI_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
+if _OPENAI_KEY:
+    _DEFAULT_PROVIDER = "openai"
+elif _DO_KEY:
+    _DEFAULT_PROVIDER = "digitalocean"
+else:
+    _DEFAULT_PROVIDER = "local"
 PROVIDER = os.environ.get("RAG_EMBED_PROVIDER", _DEFAULT_PROVIDER).strip().lower()
 
+# Uzak saglayicilar ayni kod yolunu paylasiyor (acilis probu, circuit
+# breaker, batch chunk'lama); yalnizca endpoint/anahtar/model farkli.
+_IS_REMOTE = PROVIDER in ("openai", "digitalocean")
+
 # Model adlari (provider'a gore default farkli)
-if PROVIDER == "digitalocean":
+if PROVIDER == "openai":
+    MODEL_NAME = os.environ.get("RAG_EMBED_MODEL", "text-embedding-3-small")
+elif PROVIDER == "digitalocean":
     MODEL_NAME = os.environ.get("RAG_EMBED_MODEL", "qwen3-embedding-0-6b")
 else:
     MODEL_NAME = os.environ.get("RAG_EMBED_MODEL", "paraphrase-multilingual-MiniLM-L12-v2")
+
+# SESSIZ UYUMSUZLUK KORUMASI: RAG_EMBED_PROVIDER ile RAG_EMBED_MODEL ayri
+# env degiskenleri, biri degistirilip digeri unutuluyor. Sonucu her istekte
+# 400 ve bos RAG - yani gorunurde hicbir sey. Acilista bir kez bagiriyoruz.
+if PROVIDER == "openai" and not MODEL_NAME.startswith("text-embedding-"):
+    print(
+        f"[rag/embedder] UYARI: saglayici 'openai' ama RAG_EMBED_MODEL "
+        f"'{MODEL_NAME}' - OpenAI embedding modeli degil. "
+        f"RAG_EMBED_MODEL=text-embedding-3-small olmali."
+    )
 
 NORMALIZE = os.environ.get("RAG_EMBED_NORMALIZE", "1") == "1"  # cosine icin normalize
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 
 # DigitalOcean Serverless Inference endpoint (OpenAI-uyumlu)
 DO_BASE_URL = os.environ.get("DIGITALOCEAN_BASE_URL", "https://inference.do-ai.run/v1").rstrip("/")
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 # DO inference zaman zaman cok yavas; dis RAG_QUERY_TIMEOUT (default 3s) ile
 # uyumlu olmasi icin query timeout'u kisa, ingest icin ayri (uzun) tutuyoruz.
 DO_QUERY_TIMEOUT = float(os.environ.get("RAG_EMBED_QUERY_TIMEOUT", "2.5"))
@@ -74,9 +103,11 @@ def _ensure_loaded():
             return
         _LOAD_ATTEMPTED = True
 
-        if PROVIDER == "digitalocean":
-            if not _DO_KEY:
-                print("[rag/embedder] DIGITALOCEAN_API_KEY yok, remote embedding devre disi.")
+        if _IS_REMOTE:
+            _key = _OPENAI_KEY if PROVIDER == "openai" else _DO_KEY
+            if not _key:
+                _var = "OPENAI_API_KEY" if PROVIDER == "openai" else "DIGITALOCEAN_API_KEY"
+                print(f"[rag/embedder] {_var} yok, remote embedding devre disi.")
                 _DISABLED = True  # anahtar yoksa beklemenin anlami yok, bu gercekten kalici
                 return
             import time as _time
@@ -84,13 +115,13 @@ def _ensure_loaded():
                 return
             try:
                 # Boyut algilamak icin tek seferlik prob istegi.
-                vec = _do_embed_request(["init"])
+                vec = _remote_embed_request(["init"])
                 if not vec or not vec[0]:
                     raise RuntimeError("empty response")
                 _dim = len(vec[0])
-                _model = "digitalocean"  # sentinel; lookup'larda is_ready() icin
+                _model = PROVIDER  # sentinel; lookup'larda is_ready() icin
                 _init_retry_after = 0.0
-                print(f"[rag/embedder] DigitalOcean remote OK (model={MODEL_NAME}, dim={_dim})")
+                print(f"[rag/embedder] {PROVIDER} remote OK (model={MODEL_NAME}, dim={_dim})")
             except Exception as e:
                 # KALICI OLARAK KAPATMIYORUZ. Eskiden burada _DISABLED = True
                 # vardi ve bedeli agirdi: acilis aninda saglayici bir saniye
@@ -102,7 +133,7 @@ def _ensure_loaded():
                 # Artik bir sure bekleyip tekrar deniyoruz.
                 _init_retry_after = _time.time() + _INIT_RETRY_SEC
                 print(
-                    f"[rag/embedder] DigitalOcean init hata: {e} "
+                    f"[rag/embedder] {PROVIDER} init hata: {e} "
                     f"({_INIT_RETRY_SEC:.0f}s sonra tekrar denenecek)"
                 )
             return
@@ -164,6 +195,51 @@ def _do_embed_request(texts: list[str], timeout: Optional[float] = None) -> list
     return out
 
 
+def _openai_embed_request(texts: list[str], timeout: Optional[float] = None) -> list[list[float]]:
+    """OpenAI /v1/embeddings cagrisi. Hata -> exception."""
+    if not texts:
+        return []
+    read_to = timeout if timeout is not None else DO_INGEST_TIMEOUT
+    resp = requests.post(
+        f"{OPENAI_BASE_URL}/embeddings",
+        headers={
+            "Authorization": f"Bearer {_OPENAI_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={"model": MODEL_NAME, "input": texts},
+        timeout=(DO_CONNECT_TIMEOUT, read_to),
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"OpenAI embeddings -> {resp.status_code} {resp.text[:200]}")
+    data = resp.json() or {}
+    items = data.get("data") or []
+    # OpenAI dizinin sirasini garanti etmiyor, 'index' alanina gore siraliyoruz -
+    # sira kayarsa chunk'lar YANLIS vektorle eslesir ve bu hicbir hata
+    # uretmeden arama kalitesini bozar.
+    try:
+        items = sorted(items, key=lambda it: it.get("index", 0))
+    except Exception:
+        pass
+    out: list[list[float]] = []
+    for item in items:
+        emb = item.get("embedding") if isinstance(item, dict) else None
+        if not isinstance(emb, list):
+            raise RuntimeError("OpenAI embeddings: malformed response")
+        if NORMALIZE:
+            emb = _l2_normalize(emb)
+        out.append(emb)
+    if len(out) != len(texts):
+        raise RuntimeError(f"OpenAI embeddings: expected {len(texts)} got {len(out)}")
+    return out
+
+
+def _remote_embed_request(texts: list[str], timeout: Optional[float] = None) -> list[list[float]]:
+    """Secili uzak saglayiciya yonlendirir."""
+    if PROVIDER == "openai":
+        return _openai_embed_request(texts, timeout=timeout)
+    return _do_embed_request(texts, timeout=timeout)
+
+
 def _l2_normalize(vec: list[float]) -> list[float]:
     s = 0.0
     for v in vec:
@@ -193,13 +269,13 @@ def embed_query(text: str) -> Optional[list[float]]:
     if _DISABLED or _model is None:
         return None
     # Circuit breaker: ardisik timeout sonrasi kisa sure atla
-    if PROVIDER == "digitalocean":
+    if _IS_REMOTE:
         import time as _time
         if _cooldown_until and _time.time() < _cooldown_until:
             return None
     try:
-        if PROVIDER == "digitalocean":
-            out = _do_embed_request([text], timeout=DO_QUERY_TIMEOUT)
+        if _IS_REMOTE:
+            out = _remote_embed_request([text], timeout=DO_QUERY_TIMEOUT)
             _fail_count = 0
             _cooldown_until = 0.0
             return out[0] if out else None
@@ -212,7 +288,7 @@ def embed_query(text: str) -> Optional[list[float]]:
         return vec.tolist()
     except Exception as e:
         print(f"[rag/embedder] embed_query hata: {e}")
-        if PROVIDER == "digitalocean":
+        if _IS_REMOTE:
             import time as _time
             _fail_count += 1
             if _fail_count >= _FAIL_THRESHOLD:
@@ -233,13 +309,13 @@ def embed_batch(texts: list[str], batch_size: int = 32) -> list[list[float]]:
     if _DISABLED or _model is None:
         return []
     try:
-        if PROVIDER == "digitalocean":
-            # DO API'sini batch_size'a gore chunkla (default 64)
+        if _IS_REMOTE:
+            # Uzak API'yi batch_size'a gore chunkla (default 64)
             out: list[list[float]] = []
             step = min(batch_size, DO_BATCH_LIMIT)
             for i in range(0, len(texts), step):
                 chunk = texts[i:i + step]
-                out.extend(_do_embed_request(chunk))
+                out.extend(_remote_embed_request(chunk))
             return out
         vecs = _model.encode(
             texts,
@@ -260,8 +336,8 @@ def warmup():
     if not is_ready():
         return
     try:
-        if PROVIDER == "digitalocean":
-            _do_embed_request(["isinma"])
+        if _IS_REMOTE:
+            _remote_embed_request(["isinma"])
         else:
             _model.encode("isinma", show_progress_bar=False)
     except Exception:
