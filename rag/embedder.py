@@ -104,9 +104,16 @@ _BATCH_PAUSE_SEC = float(os.environ.get("RAG_EMBED_BATCH_PAUSE_SEC", "0"))
 
 
 def _is_retryable(message: str) -> bool:
-    """429 (kota/hiz) ve 5xx gecici; 400/401 kalici."""
+    """429 (kota/hiz), 5xx ve ag hatalari gecici; 400/401 kalici."""
     m = (message or "").lower()
     if "429" in m or "rate limit" in m or "too many requests" in m:
+        return True
+    # TASIMA KATMANI HATALARI. Ilk surumde atlanmisti ve sahada bir batch
+    # bu yuzden kayboldu: "Read timed out" mesaji ne 429 ne 5xx iceriyor,
+    # dolayisiyla kalici sayilip 32 chunk dusuruldu. Oysa zaman asimi ve
+    # baglanti kopmasi, gecici oldugu en asikar hata sinifi.
+    if any(k in m for k in ("timed out", "timeout", "connection", "connectionpool",
+                            "reset by peer", "temporarily unavailable")):
         return True
     return any(code in m for code in (" 500", " 502", " 503", " 504", "-> 500", "-> 502", "-> 503", "-> 504"))
 
@@ -120,7 +127,11 @@ def _remote_embed_batch_retrying(texts: list[str]) -> list[list[float]]:
             return _remote_embed_request(texts)
         except Exception as e:
             last = str(e)
-            if not _is_retryable(last) or attempt == _BATCH_RETRIES:
+            # requests'in kendi istisnalari (Timeout, ConnectionError) mesaj
+            # metnine bakilmadan gecici sayilir - metin bicimi surumden
+            # surume degisiyor, tipe guvenmek daha saglam.
+            transport = isinstance(e, requests.RequestException)
+            if (not transport and not _is_retryable(last)) or attempt == _BATCH_RETRIES:
                 raise
             wait = _BATCH_RETRY_BASE_SEC * attempt
             print(f"[rag/embedder] batch gecici hata (deneme {attempt}/{_BATCH_RETRIES}), "
