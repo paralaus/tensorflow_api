@@ -17,6 +17,7 @@ Kullanim:
 from __future__ import annotations
 
 import os
+import re
 from typing import Optional
 
 from . import embedder, vectorstore as vs
@@ -73,7 +74,12 @@ def retrieve(question: str, top_k: Optional[int] = None) -> Optional[str]:
     for r in accepted:
         meta = r.get("metadata") or {}
         title = meta.get("title") or meta.get("file") or "kaynak"
-        body = (r.get("document") or "").strip().replace("\n", " ")
+        # BUTUN bosluk turleri tek bosluga. Yalnizca "\n" temizlemek
+        # yetmiyordu: kaynak metinlerde SATIR BASI (\r) kaliyor ve
+        # terminalde imleci satir basina atip baslik satirinin uzerine
+        # yazdiriyor - metin bozuk gorunuyor, gercekte bozuk degil. Ayni
+        # karakter modele giden prompt'a da oldugu gibi gidiyordu.
+        body = re.sub(r"\s+", " ", r.get("document") or "").strip()
         max_each = 420
         if len(body) > max_each:
             body = body[:max_each].rstrip() + "..."

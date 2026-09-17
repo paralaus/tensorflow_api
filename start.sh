@@ -16,6 +16,19 @@ if [ -z "$MEDIASOUP_ANNOUNCED_IP" ]; then
   echo "Public IP auto-detected: $MEDIASOUP_ANNOUNCED_IP"
 fi
 
+# mediasoup writes the reason a worker failed to the worker process stderr,
+# which the library routes through the `debug` module. Without DEBUG the
+# container log only shows `Error: [pid:NN, code:40, signal:null]` and the
+# actual cause is lost. Errors/warnings only, so this stays quiet in normal
+# operation; override with DEBUG=mediasoup* for full tracing.
+export DEBUG="${DEBUG:-mediasoup:ERROR*,mediasoup:WARN*}"
+
+# Fail loudly and early if the SFU worker cannot start at all (non-fatal: the
+# Flask API and the non-conference endpoints still work without it).
+echo "Running mediasoup worker preflight..."
+node scripts/check-mediasoup-worker.js \
+  || echo "WARNING: mediasoup worker preflight FAILED - conferences will not work (see output above)."
+
 # Start Gunicorn (Flask App) in background
 echo "Starting Flask API..."
 gunicorn -c gunicorn.conf.py app:app &

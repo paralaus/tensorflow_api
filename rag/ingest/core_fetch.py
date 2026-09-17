@@ -6,6 +6,13 @@ mevcut ingest adimini calistirmalisin (rglob recursive oldugu icin core/
 alt klasorunu de otomatik tarar):
     python -m rag.ingest.psychology rag/psychology_sources
 
+DIKKAT - KALICILIK: bu betigin yazdigi klasor Docker'da imajin ICINDE
+kaliyor. Hedef klasor bir volume'a baglanmazsa indirilen her sey bir
+sonraki `compose up` ile siliniyor, ustelik ingest worker ile uygulama
+container'i AYRI dosya sistemleri gordugu icin biri indirse digeri bos
+goruyor. docker-compose.yml'de psych_sources_data volume'u tam olarak
+bunun icin iki servise birden bagli - yeni bir ortam kurarken atlanmamali.
+
 Kurulum:
     1. https://core.ac.uk/api-keys/register adresinden UCRETSIZ bir API
        anahtari al (CORE, acik erisimli akademik makaleleri agregre eden
@@ -21,14 +28,12 @@ Calisma:
     python -m rag.ingest.core_fetch --limit 50
     python -m rag.ingest.core_fetch --query "bilissel davranisci terapi" --limit 30
 
-NOT: CORE v3 API'nin (api.core.ac.uk/v3) tam istek/yanit semasi bu ortamda
-CANLI DOGRULANAMADI (docs.core.ac.uk/v3 sayfasi bot-engelleme nedeniyle
-erisilemedi - sadece yayimlanmis alan adlari ve arama sonucu ozetlerinden
-derlendi). Asagidaki istek formati (q parametresi, results dizisi,
-offset/limit sayfalama, language.name:tr filtresi) CORE'un genel v3 REST
-konvansiyonlarina dayaniyor ama ilk calistirmada MUTLAKA --dry-run ile
-kontrol et; yanit semasi farkliysa _parse_response'u gercek yanita gore
-guncelle.
+NOT: istek/yanit semasi artik CANLI DOGRULANDI. q parametresi, results
+dizisi ve offset/limit sayfalama dogru calisiyor; _parse_response gercek
+yanitla uyumlu. Dil filtresi ise YANLISTI (language.name -> language.code)
+ve tirnakli ifadeler CORE tarafindan reddediliyor; ayrinti DEFAULT_QUERY
+uzerindeki notta. Sorguyu degistirirken once --dry-run ile dogrula: hatali
+sozdizimi 400 degil 500 donduruyor, yani "sunucu arizasi" gibi gorunuyor.
 """
 from __future__ import annotations
 
@@ -52,37 +57,211 @@ PAGE_SIZE = int(os.environ.get("CORE_FETCH_PAGE_SIZE", "20"))
 # CORE'un dokumante edilen rate limiti dusuk (tekli aramalar icin 10sn'de
 # birkac istek) - varsayilan gecikme temkinli tutuldu.
 REQUEST_DELAY_SEC = float(os.environ.get("CORE_FETCH_DELAY_SEC", "2.0"))
+# Konular arasi bekleme. Sayfa ARASI beklemeden ayri: 18 konu arka arkaya
+# kosunca CORE'un hiz limiti ucuncu konuda doluyordu.
+TOPIC_DELAY_SEC = float(os.environ.get("CORE_FETCH_TOPIC_DELAY_SEC", "10"))
+# 429 sonrasi beklenecek sure (deneme basina katlanarak artar).
+RATE_LIMIT_WAIT_SEC = float(os.environ.get("CORE_FETCH_RATE_WAIT_SEC", "30"))
 # Gercek testte CORE'un arama sorgulari (ozellikle coklu OR terimli
 # sorgular) tek sayfa icin bile 45-60sn surebiliyor - varsayilani buna
 # gore comert tuttuk, aksi halde varsayilan ayarlarla her calistirma
 # timeout'a takilabiliyordu.
 HTTP_TIMEOUT = float(os.environ.get("CORE_FETCH_TIMEOUT", "60"))
-MIN_TEXT_CHARS = 200  # ozet/fulltext bu kadardan kisaysa anlamsiz, atla
+# Bu uzunlugun altindaki kayitlar atlanir.
+#
+# VARSAYILAN DUSUK: CORE cogu kayit icin fulltext degil SADECE OZET
+# donduruyor ve Turkce ozetler siklikla 800-2000 karakter. 200 esigi
+# bunlarin hepsini iceri aliyor - corpus buyuyor ama "psikoloji tarihi"
+# turu bir ozetin klinik degeri yok, ustelik TOP_K=4 oldugu icin boyle bir
+# chunk benzerlik yarisini kazanip ise yarar bir kaydin yerini alabiliyor.
+# Corpus kalitesini yukseltmek icin CORE_FETCH_MIN_CHARS=1500 gibi bir
+# deger deneyin; bedeli daha az ama daha dolu kayit.
+MIN_TEXT_CHARS = int(os.environ.get("CORE_FETCH_MIN_CHARS", "200"))
 
+# Tek bir kaydin corpus'ta kaplayabilecegi ust sinir.
+#
+# CORE cogu tez icin TAM METIN donduruyor: sahada dosya basina ortalama
+# ~152 bin karakter cikti ve 100 dosya 12 bin chunk uretti. Bir tezin
+# yontem ve bulgular bolumleri bir terapi asistani icin bilgi tasimiyor,
+# ama chunk sayisinin buyuk kismini onlar olusturuyor ve arama sonuclarini
+# seyreltiyorlar. Kirpma metnin BASINI koruyor - ozet, giris ve kuramsal
+# cerceve orada.
+# 0 = kirpma yok.
+MAX_TEXT_CHARS = int(os.environ.get("CORE_FETCH_MAX_CHARS", "60000"))
+
+# CORE v3 SORGU SOZDIZIMI - CANLI OLCULDU, TAHMIN DEGIL.
+#
+# Onceki varsayilan sorgu her cagride HTTP 500 donduruyordu ve bu, psikoloji
+# corpus'unun hic olusmamasinin dogrudan sebebiydi. CORE v3 arkada Azure
+# Cognitive Search kullaniyor ve iki kural var:
+#
+#   1. TIRNAKLI IFADE YASAK. "bilişsel davranışçı" gibi bir ifade
+#      "OperationNotAllowed - ... is not a searchable field" hatasi veriyor.
+#      Terimler tek tek, tirnaksiz ve OR ile baglanmali.
+#   2. DIL ALANININ ADI language.code, language.name DEGIL. Ikincisi
+#      "InvalidName" hatasi veriyor.
+#
+# Ayrica CORE Turkce diyakritikleri KATLAMIYOR: "kaygi" ile "kaygı" farkli
+# sonuc kumeleri getiriyor (aksansiz 3629, aksanli 6213 kayit) ve aksanli
+# form klinik olarak belirgin sekilde daha alakali basliklar donduruyor.
+# O yuzden her iki yazim da listede - birlesimi aliyoruz (6226 kayit).
+#
+# Yeniden olcmek icin: rag/ingest/core_fetch.py --query "..." --dry-run
 DEFAULT_QUERY = (
-    '(psikoloji OR psychology OR "bilişsel davranışçı" OR "cognitive behavioral" '
-    'OR "klinik psikoloji" OR "clinical psychology") AND language.name:tr'
+    "(psikoterapi OR psikoloji OR terapi OR anksiyete OR depresyon OR "
+    "kaygı OR kaygi OR travma OR bilişsel OR bilissel OR davranışçı OR "
+    "davranisci OR psikiyatri) AND language.code:tr"
 )
+
+LANG_FILTER = os.environ.get("CORE_FETCH_LANG", "language.code:tr")
+
+# KONU LISTESI - tek genis sorgu yerine hedefli cekimler.
+#
+# NEDEN: tek bir genis sorgu, CORE'un alaka siralamasina gore ilk N kaydi
+# getiriyor ve bu kayitlar birkac konuya yigiliyor. Danisanin "panik atak
+# geciriyorum" ile "yakinimi kaybettim" sorularinin ikisine de karsilik
+# verebilmek icin corpus'un konu konu beslenmesi gerekiyor.
+#
+# SORGULAR ELLE AYARLI, SABLONDAN URETILMIYOR - olculdu:
+# ikinci bir AND grubu (terapi/mudahale/tedavi) GENEL terimlerde isabeti
+# muazzam artiriyor ("farkındalık OR kabul" 11748 kayit ve ragbi
+# oyuncularini getirirken, mudahale grubu eklenince 355 kayda iniyor ve
+# basliklar "Bilincli Farkindalik Temelli Bilissel Terapi Programi" gibi
+# oluyor). Ama zaten spesifik terimlerde ayni ek hacmi kesiyor ve konuyu
+# dagitiyor (uyku 606 -> 166, sonuclar uyku apnesi ve kupa terapisine
+# kayiyor). O yuzden her konu kendi sorgusunu tasiyor.
+#
+# TIRNAKLI IFADE YOK, COK KELIMELI TERIM DE YOK. CORE tirnaga izin
+# vermiyor (OperationNotAllowed) ve tirnaksiz "kendine zarar" gibi bir
+# terim beklenmedik sekilde ayrisip sorguyu genisletiyor. Her terim TEK
+# KELIME olmali; ayrisma riskini bastan kaldiriyor.
+#
+# Yeni konu eklerken once olc:
+#   python -m rag.ingest.core_fetch --query "<sorgu>" --limit 5 --dry-run
+_INTERV = "(terapi OR psikoterapi OR müdahale OR tedavi OR program)"
+DEFAULT_TOPICS = [
+    # Spesifik terimler: ek grup gerekmiyor.
+    "(anksiyete OR kaygı OR panik OR agorafobi)",
+    "(travma OR TSSB OR istismar OR ayrışma)",
+    "(uykusuzluk OR insomnia OR uyku)",
+    "(obsesif OR kompulsif OR OKB)",
+    "(sosyal OR utangaçlık OR çekingen) AND (kaygı OR fobi)",
+    "(yas OR matem OR kayıp) AND (danışmanlık OR " + _INTERV.strip("()") + ")",
+    "(öfke OR saldırganlık) AND (kontrol OR düzenleme OR " + _INTERV.strip("()") + ")",
+    "(intihar OR özkıyım) AND (önleme OR risk OR değerlendirme)",
+    "(madde OR bağımlılık OR alkol) AND " + _INTERV,
+    "(yeme OR anoreksiya OR bulimia) AND " + _INTERV,
+    "(ergen OR çocuk) AND (psikopatoloji OR psikiyatri OR psikoterapi)",
+    "(çift OR evlilik OR ilişki) AND (çatışma OR " + _INTERV.strip("()") + ")",
+    # Genel terimler: ek grup SART, yoksa alakasiz alanlara yayiliyor.
+    "(depresyon OR depresif OR duygudurum) AND " + _INTERV,
+    "(farkındalık OR mindfulness OR şefkat) AND " + _INTERV,
+    "(bilişsel OR davranışçı) AND " + _INTERV,
+    "(duygu OR emosyon) AND (düzenleme OR regülasyon) AND " + _INTERV,
+    "(stres OR tükenmişlik) AND " + _INTERV,
+    "(benlik OR özsaygı OR özgüven) AND " + _INTERV,
+]
+
+
+def _topics_from_env() -> Optional[list]:
+    """CORE_FETCH_TOPICS: satir ya da ';' ile ayrilmis sorgular."""
+    raw = os.environ.get("CORE_FETCH_TOPICS", "").strip()
+    if not raw:
+        return None
+    parts = [t.strip() for chunk in raw.split("\n") for t in chunk.split(";")]
+    return [t for t in parts if t] or None
 
 
 def _headers() -> dict:
     return {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
 
 
+# CORE ARA SIRA 500 DONUYOR VE BU GECICI.
+#
+# Olculdu: ayni sorgu ust uste ucunde 200 donerken bir baskasinda
+# {"message": "Idle timeout reached for ...search.windows.net..."} ile 500
+# donebiliyor - arkadaki Azure Search bazen yetismiyore. Yani 500 burada
+# "istek hatali" DEGIL, "tekrar dene" demek.
+#
+# Tekrar denemesiz hali bu boru hattini kumar haline getiriyordu: tek bir
+# gecici 500, butun psikoloji fetch'ini iptal ediyor, bootstrap
+# "core failed" yazip geciyor ve corpus bir sonraki gune kadar bos kaliyor.
+CORE_RETRIES = int(os.environ.get("CORE_FETCH_RETRIES", "4"))
+CORE_RETRY_BACKOFF_SEC = float(os.environ.get("CORE_FETCH_RETRY_BACKOFF_SEC", "5"))
+
+
+def _error_message(resp) -> str:
+    """Yanit govdesinden okunabilir hata metnini cikarir.
+
+    NEDEN: eskiden yalnizca raise_for_status()'un tek satiri loglaniyordu
+    ("500 Server Error ... for url: ...") ve bu, GECICI bir zaman asimi ile
+    HATALI SORGU sozdizimini ayirt edilemez kiliyordu. Ikisi de 500 donuyor;
+    fark sadece govdede. Bu yuzden language.name hatasi uzun sure
+    "CORE bozuk" sanildi.
+    """
+    try:
+        data = resp.json() or {}
+        msg = data.get("message") or data.get("error") or ""
+        if msg:
+            return str(msg)[:200]
+    except Exception:
+        pass
+    return (resp.text or "")[:200]
+
+
 def search(query: str, *, offset: int, limit: int) -> dict[str, Any]:
-    """CORE v3 /search/works cagrisi. Hata -> exception (caller yakalar)."""
-    resp = requests.get(
-        f"{API_BASE_URL}/search/works",
-        params={"q": query, "offset": offset, "limit": limit},
-        headers=_headers(),
-        timeout=HTTP_TIMEOUT,
-    )
-    if resp.status_code == 401:
-        raise RuntimeError("CORE API 401 Unauthorized - CORE_API_KEY eksik/gecersiz.")
-    if resp.status_code == 429:
-        raise RuntimeError("CORE API 429 Too Many Requests - CORE_FETCH_DELAY_SEC'i artir.")
-    resp.raise_for_status()
-    return resp.json()
+    """CORE v3 /search/works cagrisi. Gecici hatalarda tekrar dener."""
+    last_detail = ""
+    for attempt in range(1, CORE_RETRIES + 1):
+        try:
+            resp = requests.get(
+                f"{API_BASE_URL}/search/works",
+                params={"q": query, "offset": offset, "limit": limit},
+                headers=_headers(),
+                timeout=HTTP_TIMEOUT,
+            )
+        except requests.RequestException as e:
+            last_detail = f"baglanti: {str(e)[:150]}"
+        else:
+            # Bunlar tekrar denemekle duzelmez - hemen bildir.
+            if resp.status_code == 401:
+                raise RuntimeError("CORE API 401 Unauthorized - CORE_API_KEY eksik/gecersiz.")
+            if resp.status_code == 429:
+                # 429 KALICI DEGIL, "bekle ve tekrar dene" demek.
+                #
+                # Eskiden burada hemen exception atiliyordu ve bu, konu
+                # listesiyle birlikte kotu bir etkilesim uretiyordu: limit
+                # ucuncu konuda dolunca kalan 15 konu HIC BEKLEMEDEN pes
+                # pese dusuyordu. Tek bir sorgu icin makul olan davranis,
+                # 18 sorgunun ardi ardina kostugu yerde cekimi bastan
+                # sakatliyordu. Diger gecici hatalardan daha uzun
+                # bekliyoruz: CORE'un limiti zaman pencereli.
+                last_detail = "HTTP 429 Too Many Requests"
+                if attempt < CORE_RETRIES:
+                    wait = RATE_LIMIT_WAIT_SEC * attempt
+                    print(f"[core_fetch] hiz limiti (deneme {attempt}/{CORE_RETRIES}); "
+                          f"{wait:.0f}s bekleniyor.")
+                    time.sleep(wait)
+                    continue
+                raise RuntimeError(
+                    "CORE API 429 Too Many Requests - CORE_FETCH_DELAY_SEC ya da "
+                    "CORE_FETCH_TOPIC_DELAY_SEC'i artir."
+                )
+            if resp.status_code < 400:
+                return resp.json()
+
+            last_detail = f"HTTP {resp.status_code}: {_error_message(resp)}"
+            # 4xx (429 haric) bizim sorgumuzun hatasi; tekrar denemek bosuna.
+            if 400 <= resp.status_code < 500:
+                raise RuntimeError(f"CORE API {last_detail}")
+
+        if attempt < CORE_RETRIES:
+            wait = CORE_RETRY_BACKOFF_SEC * attempt
+            print(f"[core_fetch] {last_detail} (deneme {attempt}/{CORE_RETRIES}); "
+                  f"{wait:.0f}s sonra tekrar.")
+            time.sleep(wait)
+
+    raise RuntimeError(f"CORE API {CORE_RETRIES} denemede basarisiz - {last_detail}")
 
 
 def _parse_response(data: dict[str, Any]) -> tuple[list[dict], int]:
@@ -118,6 +297,8 @@ def make_text(record: dict[str, Any]) -> Optional[str]:
     year = record.get("yearPublished") or record.get("year") or ""
 
     body = full_text if len(full_text) > len(abstract) else abstract
+    if MAX_TEXT_CHARS > 0 and len(body) > MAX_TEXT_CHARS:
+        body = body[:MAX_TEXT_CHARS]
     if len(body) < MIN_TEXT_CHARS:
         return None
 
@@ -191,21 +372,60 @@ def fetch(query: str, *, limit: int, dry_run: bool = False) -> dict[str, Any]:
     return summary
 
 
+def _with_lang(query: str) -> str:
+    """Konu sorgusuna dil filtresini ekler (zaten varsa dokunmaz)."""
+    if not LANG_FILTER or LANG_FILTER in query:
+        return query
+    return f"{query} AND {LANG_FILTER}"
+
+
 def main(argv: Optional[list] = None) -> int:
     p = argparse.ArgumentParser(description="CORE API'den (core.ac.uk) psikoloji literaturu cek")
-    p.add_argument("--query", type=str, default=DEFAULT_QUERY, help="CORE arama sorgusu")
-    p.add_argument("--limit", type=int, default=50, help="En fazla kac makale cekilsin")
+    p.add_argument("--query", type=str, default=None,
+                   help="Tek bir CORE arama sorgusu. Verilmezse konu listesi dolasilir.")
+    p.add_argument("--topics", action="store_true",
+                   help="Konu listesini acikca kullan (--query verilmediginde zaten varsayilan)")
+    p.add_argument("--limit", type=int, default=50,
+                   help="KONU BASINA en fazla kac makale cekilsin")
     p.add_argument("--dry-run", action="store_true", help="Dosya yazma, sadece raporla")
     args = p.parse_args(argv)
 
-    try:
-        summary = fetch(args.query, limit=args.limit, dry_run=args.dry_run)
-    except Exception as e:
-        print(f"[core_fetch] hata: {e}", file=sys.stderr)
-        return 1
+    if args.query and not args.topics:
+        queries = [args.query]
+    else:
+        queries = _topics_from_env() or DEFAULT_TOPICS
 
-    print(f"[core_fetch] sonuc: {summary}")
-    if not args.dry_run and summary["written"] > 0:
+    total = {"fetched": 0, "written": 0, "skipped_duplicate": 0, "skipped_short": 0}
+    failed = 0
+    for idx, q in enumerate(queries, 1):
+        full = _with_lang(q)
+        label = q if len(q) <= 64 else q[:61] + "..."
+        print(f"[core_fetch] konu {idx}/{len(queries)}: {label}")
+        try:
+            summary = fetch(full, limit=args.limit, dry_run=args.dry_run)
+        except Exception as e:
+            # TEK KONUNUN HATASI BUTUN CEKIMI IPTAL ETMEMELI. Bir konu
+            # sorgusu CORE tarafindan reddedilirse ya da tekrar denemeler
+            # tukenirse digerleri yine de calissin; aksi halde tek bir
+            # aksilik corpus'un tamamini gunceltmeden birakiyor.
+            failed += 1
+            print(f"[core_fetch] konu basarisiz ({label}): {e}", file=sys.stderr)
+            if idx < len(queries) and TOPIC_DELAY_SEC > 0:
+                time.sleep(TOPIC_DELAY_SEC)
+            continue
+        for k in total:
+            total[k] += summary.get(k, 0)
+        print(f"[core_fetch]   -> {summary}")
+        if idx < len(queries) and TOPIC_DELAY_SEC > 0:
+            time.sleep(TOPIC_DELAY_SEC)
+
+    total["topics"] = len(queries)
+    total["failed_topics"] = failed
+    total["dry_run"] = args.dry_run
+    print(f"[core_fetch] sonuc: {total}")
+    if failed:
+        print(f"[core_fetch] UYARI: {failed}/{len(queries)} konu cekilemedi.", file=sys.stderr)
+    if not args.dry_run and total["written"] > 0:
         print(f"[core_fetch] Simdi calistir: python -m rag.ingest.psychology {DEST_DIR}")
     return 0
 

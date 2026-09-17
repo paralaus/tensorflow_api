@@ -48,6 +48,7 @@ const fs = require('fs');
 const dgram = require('dgram');
 const nodeCrypto = require('crypto');
 const config = require('./config');
+const { describeWorkerFailure } = require('./mediasoupWorkerError');
 const checkXSS = require('./XSS.js');
 const Host = require('./Host');
 const Room = require('./Room');
@@ -1257,7 +1258,10 @@ const io = require('socket.io')(httpsServer, {
 // goes through ConferenceSocket, while live HLS pipeline state lives here
 // in Server.js — the hook bridges the two.
 const conferenceSocketMod = require('./ConferenceSocket');
-conferenceSocketMod(io).catch(err => console.error('Failed to init conference socket:', err));
+conferenceSocketMod(io).catch(err => {
+    console.error('Failed to init conference socket:', err);
+    console.error(describeWorkerFailure(err));
+});
 conferenceSocketMod.setOnProducerAddedHook((roomId) => {
     try {
         maybeStartLiveHlsForRoom(roomId);
@@ -2387,6 +2391,10 @@ function startServer() {
             await createWorkers();
         } catch (err) {
             log.error('İşleyici yaratma HATASI --->', err);
+            // mediasoup only gives `[pid:NN, code:NN, signal:null]` here; the
+            // worker's stderr with the real reason goes through `debug` and is
+            // dropped unless DEBUG is set. Spell the exit code out instead.
+            log.error(describeWorkerFailure(err));
             process.exit(1);
         }
     })();
