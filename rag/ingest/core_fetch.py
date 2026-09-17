@@ -28,14 +28,12 @@ Calisma:
     python -m rag.ingest.core_fetch --limit 50
     python -m rag.ingest.core_fetch --query "bilissel davranisci terapi" --limit 30
 
-NOT: CORE v3 API'nin (api.core.ac.uk/v3) tam istek/yanit semasi bu ortamda
-CANLI DOGRULANAMADI (docs.core.ac.uk/v3 sayfasi bot-engelleme nedeniyle
-erisilemedi - sadece yayimlanmis alan adlari ve arama sonucu ozetlerinden
-derlendi). Asagidaki istek formati (q parametresi, results dizisi,
-offset/limit sayfalama, language.name:tr filtresi) CORE'un genel v3 REST
-konvansiyonlarina dayaniyor ama ilk calistirmada MUTLAKA --dry-run ile
-kontrol et; yanit semasi farkliysa _parse_response'u gercek yanita gore
-guncelle.
+NOT: istek/yanit semasi artik CANLI DOGRULANDI. q parametresi, results
+dizisi ve offset/limit sayfalama dogru calisiyor; _parse_response gercek
+yanitla uyumlu. Dil filtresi ise YANLISTI (language.name -> language.code)
+ve tirnakli ifadeler CORE tarafindan reddediliyor; ayrinti DEFAULT_QUERY
+uzerindeki notta. Sorguyu degistirirken once --dry-run ile dogrula: hatali
+sozdizimi 400 degil 500 donduruyor, yani "sunucu arizasi" gibi gorunuyor.
 """
 from __future__ import annotations
 
@@ -75,9 +73,28 @@ HTTP_TIMEOUT = float(os.environ.get("CORE_FETCH_TIMEOUT", "60"))
 # deger deneyin; bedeli daha az ama daha dolu kayit.
 MIN_TEXT_CHARS = int(os.environ.get("CORE_FETCH_MIN_CHARS", "200"))
 
+# CORE v3 SORGU SOZDIZIMI - CANLI OLCULDU, TAHMIN DEGIL.
+#
+# Onceki varsayilan sorgu her cagride HTTP 500 donduruyordu ve bu, psikoloji
+# corpus'unun hic olusmamasinin dogrudan sebebiydi. CORE v3 arkada Azure
+# Cognitive Search kullaniyor ve iki kural var:
+#
+#   1. TIRNAKLI IFADE YASAK. "bilişsel davranışçı" gibi bir ifade
+#      "OperationNotAllowed - ... is not a searchable field" hatasi veriyor.
+#      Terimler tek tek, tirnaksiz ve OR ile baglanmali.
+#   2. DIL ALANININ ADI language.code, language.name DEGIL. Ikincisi
+#      "InvalidName" hatasi veriyor.
+#
+# Ayrica CORE Turkce diyakritikleri KATLAMIYOR: "kaygi" ile "kaygı" farkli
+# sonuc kumeleri getiriyor (aksansiz 3629, aksanli 6213 kayit) ve aksanli
+# form klinik olarak belirgin sekilde daha alakali basliklar donduruyor.
+# O yuzden her iki yazim da listede - birlesimi aliyoruz (6226 kayit).
+#
+# Yeniden olcmek icin: rag/ingest/core_fetch.py --query "..." --dry-run
 DEFAULT_QUERY = (
-    '(psikoloji OR psychology OR "bilişsel davranışçı" OR "cognitive behavioral" '
-    'OR "klinik psikoloji" OR "clinical psychology") AND language.name:tr'
+    "(psikoterapi OR psikoloji OR terapi OR anksiyete OR depresyon OR "
+    "kaygı OR kaygi OR travma OR bilişsel OR bilissel OR davranışçı OR "
+    "davranisci OR psikiyatri) AND language.code:tr"
 )
 
 
