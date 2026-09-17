@@ -274,10 +274,16 @@ def ingest(source_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
         return summary
 
     ok_count = 0
+    failed_batches = 0
     for i in range(0, len(docs), EMBED_BATCH):
         batch = docs[i : i + EMBED_BATCH]
-        embs = embedder.embed_batch([d["document"] for d in batch], batch_size=EMBED_BATCH)
+        try:
+            embs = embedder.embed_batch([d["document"] for d in batch], batch_size=EMBED_BATCH)
+        except Exception as e:
+            embs = []
+            print(f"[psych] embed hata (chunk {i}-{i+len(batch)}): {e}", file=sys.stderr)
         if not embs or len(embs) != len(batch):
+            failed_batches += 1
             print(f"[psych] embed_batch beklenmedik sonuc (chunk {i}-{i+len(batch)}), atlandi.", file=sys.stderr)
             continue
         ok = vs.upsert(
@@ -289,8 +295,29 @@ def ingest(source_dir: str, *, dry_run: bool = False) -> dict[str, Any]:
         )
         if ok:
             ok_count += len(batch)
+        else:
+            failed_batches += 1
 
     summary["upserted"] = ok_count
+    summary["failed_batches"] = failed_batches
+
+    # EKSIK INDEKSI SESSIZ BIRAKMA.
+    #
+    # Eskiden basarisiz batch'ler yalnizca stderr'e bir satir yaziyordu ve
+    # ozet satirindaki chunks/upserted farkini kimse okumuyordu. Sahada
+    # 12282 chunk'in 8128'i yazildi - yani corpus'un ucte biri eksikti ve
+    # bu, "RAG calisiyor" goruntusunun altinda gizli kaldi. Eksik indeks
+    # hatali indeksten daha sinsi: sorgular calisiyor, sadece bazi
+    # konularda hicbir sey bulunamiyor.
+    if ok_count < len(docs):
+        missing = len(docs) - ok_count
+        print(
+            f"[psych] UYARI: {missing} chunk INDEKSLENEMEDI "
+            f"({failed_batches} batch basarisiz). Corpus EKSIK. "
+            f"Sebep genellikle saglayici hiz limiti; tekrar calistirmak "
+            f"eksikleri tamamlar (ingest idempotent).",
+            file=sys.stderr,
+        )
     return summary
 
 

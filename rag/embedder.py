@@ -87,6 +87,47 @@ _cooldown_until = 0.0
 _INIT_RETRY_SEC = float(os.environ.get("RAG_EMBED_INIT_RETRY_SEC", "120"))
 _init_retry_after = 0.0
 
+# INGEST icin tekrar deneme. embed_query'den AYRI tutuluyor: sohbet yolunda
+# uzun beklemek kabul edilemez (orada devrede olan sey circuit breaker),
+# ama ingest toplu ve arka planda calisiyor, orada beklemek dogru davranis.
+#
+# NEDEN GEREKLI: OpenAI'in dakika basina token limiti (TPM) toplu ingest'te
+# kolayca doluyor. 429 geldiginde eski kod butun batch'i dusurup bos liste
+# donduruyor, ingest de o batch'i "atlandi" deyip geciyordu. Sonuc SESSIZ
+# EKSIK INDEKS: sahada 12282 chunk'in yalnizca 8128'i yazildi, 4154 chunk
+# hicbir yerde gorunmeden kayboldu. TPM limiti bir dakika icinde sifirlandigi
+# icin beklemek tek dogru cevap.
+_BATCH_RETRIES = int(os.environ.get("RAG_EMBED_BATCH_RETRIES", "6"))
+_BATCH_RETRY_BASE_SEC = float(os.environ.get("RAG_EMBED_RETRY_BASE_SEC", "10"))
+# Batch'ler arasi bekleme; TPM'e surekli carpiyorsan 0.5-1 sn ver.
+_BATCH_PAUSE_SEC = float(os.environ.get("RAG_EMBED_BATCH_PAUSE_SEC", "0"))
+
+
+def _is_retryable(message: str) -> bool:
+    """429 (kota/hiz) ve 5xx gecici; 400/401 kalici."""
+    m = (message or "").lower()
+    if "429" in m or "rate limit" in m or "too many requests" in m:
+        return True
+    return any(code in m for code in (" 500", " 502", " 503", " 504", "-> 500", "-> 502", "-> 503", "-> 504"))
+
+
+def _remote_embed_batch_retrying(texts: list[str]) -> list[list[float]]:
+    """Tek bir batch'i, gecici hatalarda bekleyerek tekrar dener."""
+    import time as _time
+    last = ""
+    for attempt in range(1, _BATCH_RETRIES + 1):
+        try:
+            return _remote_embed_request(texts)
+        except Exception as e:
+            last = str(e)
+            if not _is_retryable(last) or attempt == _BATCH_RETRIES:
+                raise
+            wait = _BATCH_RETRY_BASE_SEC * attempt
+            print(f"[rag/embedder] batch gecici hata (deneme {attempt}/{_BATCH_RETRIES}), "
+                  f"{wait:.0f}s bekleniyor: {last[:120]}")
+            _time.sleep(wait)
+    raise RuntimeError(last)
+
 _model = None
 _dim: Optional[int] = None
 _lock = threading.Lock()
@@ -311,11 +352,14 @@ def embed_batch(texts: list[str], batch_size: int = 32) -> list[list[float]]:
     try:
         if _IS_REMOTE:
             # Uzak API'yi batch_size'a gore chunkla (default 64)
+            import time as _time
             out: list[list[float]] = []
             step = min(batch_size, DO_BATCH_LIMIT)
             for i in range(0, len(texts), step):
                 chunk = texts[i:i + step]
-                out.extend(_remote_embed_request(chunk))
+                out.extend(_remote_embed_batch_retrying(chunk))
+                if _BATCH_PAUSE_SEC > 0 and i + step < len(texts):
+                    _time.sleep(_BATCH_PAUSE_SEC)
             return out
         vecs = _model.encode(
             texts,
