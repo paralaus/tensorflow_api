@@ -64,7 +64,16 @@ REQUEST_DELAY_SEC = float(os.environ.get("CORE_FETCH_DELAY_SEC", "2.0"))
 # gore comert tuttuk, aksi halde varsayilan ayarlarla her calistirma
 # timeout'a takilabiliyordu.
 HTTP_TIMEOUT = float(os.environ.get("CORE_FETCH_TIMEOUT", "60"))
-MIN_TEXT_CHARS = 200  # ozet/fulltext bu kadardan kisaysa anlamsiz, atla
+# Bu uzunlugun altindaki kayitlar atlanir.
+#
+# VARSAYILAN DUSUK: CORE cogu kayit icin fulltext degil SADECE OZET
+# donduruyor ve Turkce ozetler siklikla 800-2000 karakter. 200 esigi
+# bunlarin hepsini iceri aliyor - corpus buyuyor ama "psikoloji tarihi"
+# turu bir ozetin klinik degeri yok, ustelik TOP_K=4 oldugu icin boyle bir
+# chunk benzerlik yarisini kazanip ise yarar bir kaydin yerini alabiliyor.
+# Corpus kalitesini yukseltmek icin CORE_FETCH_MIN_CHARS=1500 gibi bir
+# deger deneyin; bedeli daha az ama daha dolu kayit.
+MIN_TEXT_CHARS = int(os.environ.get("CORE_FETCH_MIN_CHARS", "200"))
 
 DEFAULT_QUERY = (
     '(psikoloji OR psychology OR "bilişsel davranışçı" OR "cognitive behavioral" '
