@@ -6,6 +6,13 @@ mevcut ingest adimini calistirmalisin (rglob recursive oldugu icin core/
 alt klasorunu de otomatik tarar):
     python -m rag.ingest.psychology rag/psychology_sources
 
+DIKKAT - KALICILIK: bu betigin yazdigi klasor Docker'da imajin ICINDE
+kaliyor. Hedef klasor bir volume'a baglanmazsa indirilen her sey bir
+sonraki `compose up` ile siliniyor, ustelik ingest worker ile uygulama
+container'i AYRI dosya sistemleri gordugu icin biri indirse digeri bos
+goruyor. docker-compose.yml'de psych_sources_data volume'u tam olarak
+bunun icin iki servise birden bagli - yeni bir ortam kurarken atlanmamali.
+
 Kurulum:
     1. https://core.ac.uk/api-keys/register adresinden UCRETSIZ bir API
        anahtari al (CORE, acik erisimli akademik makaleleri agregre eden
