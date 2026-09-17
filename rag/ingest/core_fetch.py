@@ -73,6 +73,17 @@ HTTP_TIMEOUT = float(os.environ.get("CORE_FETCH_TIMEOUT", "60"))
 # deger deneyin; bedeli daha az ama daha dolu kayit.
 MIN_TEXT_CHARS = int(os.environ.get("CORE_FETCH_MIN_CHARS", "200"))
 
+# Tek bir kaydin corpus'ta kaplayabilecegi ust sinir.
+#
+# CORE cogu tez icin TAM METIN donduruyor: sahada dosya basina ortalama
+# ~152 bin karakter cikti ve 100 dosya 12 bin chunk uretti. Bir tezin
+# yontem ve bulgular bolumleri bir terapi asistani icin bilgi tasimiyor,
+# ama chunk sayisinin buyuk kismini onlar olusturuyor ve arama sonuclarini
+# seyreltiyorlar. Kirpma metnin BASINI koruyor - ozet, giris ve kuramsal
+# cerceve orada.
+# 0 = kirpma yok.
+MAX_TEXT_CHARS = int(os.environ.get("CORE_FETCH_MAX_CHARS", "60000"))
+
 # CORE v3 SORGU SOZDIZIMI - CANLI OLCULDU, TAHMIN DEGIL.
 #
 # Onceki varsayilan sorgu her cagride HTTP 500 donduruyordu ve bu, psikoloji
@@ -96,6 +107,64 @@ DEFAULT_QUERY = (
     "kaygı OR kaygi OR travma OR bilişsel OR bilissel OR davranışçı OR "
     "davranisci OR psikiyatri) AND language.code:tr"
 )
+
+LANG_FILTER = os.environ.get("CORE_FETCH_LANG", "language.code:tr")
+
+# KONU LISTESI - tek genis sorgu yerine hedefli cekimler.
+#
+# NEDEN: tek bir genis sorgu, CORE'un alaka siralamasina gore ilk N kaydi
+# getiriyor ve bu kayitlar birkac konuya yigiliyor. Danisanin "panik atak
+# geciriyorum" ile "yakinimi kaybettim" sorularinin ikisine de karsilik
+# verebilmek icin corpus'un konu konu beslenmesi gerekiyor.
+#
+# SORGULAR ELLE AYARLI, SABLONDAN URETILMIYOR - olculdu:
+# ikinci bir AND grubu (terapi/mudahale/tedavi) GENEL terimlerde isabeti
+# muazzam artiriyor ("farkındalık OR kabul" 11748 kayit ve ragbi
+# oyuncularini getirirken, mudahale grubu eklenince 355 kayda iniyor ve
+# basliklar "Bilincli Farkindalik Temelli Bilissel Terapi Programi" gibi
+# oluyor). Ama zaten spesifik terimlerde ayni ek hacmi kesiyor ve konuyu
+# dagitiyor (uyku 606 -> 166, sonuclar uyku apnesi ve kupa terapisine
+# kayiyor). O yuzden her konu kendi sorgusunu tasiyor.
+#
+# TIRNAKLI IFADE YOK, COK KELIMELI TERIM DE YOK. CORE tirnaga izin
+# vermiyor (OperationNotAllowed) ve tirnaksiz "kendine zarar" gibi bir
+# terim beklenmedik sekilde ayrisip sorguyu genisletiyor. Her terim TEK
+# KELIME olmali; ayrisma riskini bastan kaldiriyor.
+#
+# Yeni konu eklerken once olc:
+#   python -m rag.ingest.core_fetch --query "<sorgu>" --limit 5 --dry-run
+_INTERV = "(terapi OR psikoterapi OR müdahale OR tedavi OR program)"
+DEFAULT_TOPICS = [
+    # Spesifik terimler: ek grup gerekmiyor.
+    "(anksiyete OR kaygı OR panik OR agorafobi)",
+    "(travma OR TSSB OR istismar OR ayrışma)",
+    "(uykusuzluk OR insomnia OR uyku)",
+    "(obsesif OR kompulsif OR OKB)",
+    "(sosyal OR utangaçlık OR çekingen) AND (kaygı OR fobi)",
+    "(yas OR matem OR kayıp) AND (danışmanlık OR " + _INTERV.strip("()") + ")",
+    "(öfke OR saldırganlık) AND (kontrol OR düzenleme OR " + _INTERV.strip("()") + ")",
+    "(intihar OR özkıyım) AND (önleme OR risk OR değerlendirme)",
+    "(madde OR bağımlılık OR alkol) AND " + _INTERV,
+    "(yeme OR anoreksiya OR bulimia) AND " + _INTERV,
+    "(ergen OR çocuk) AND (psikopatoloji OR psikiyatri OR psikoterapi)",
+    "(çift OR evlilik OR ilişki) AND (çatışma OR " + _INTERV.strip("()") + ")",
+    # Genel terimler: ek grup SART, yoksa alakasiz alanlara yayiliyor.
+    "(depresyon OR depresif OR duygudurum) AND " + _INTERV,
+    "(farkındalık OR mindfulness OR şefkat) AND " + _INTERV,
+    "(bilişsel OR davranışçı) AND " + _INTERV,
+    "(duygu OR emosyon) AND (düzenleme OR regülasyon) AND " + _INTERV,
+    "(stres OR tükenmişlik) AND " + _INTERV,
+    "(benlik OR özsaygı OR özgüven) AND " + _INTERV,
+]
+
+
+def _topics_from_env() -> Optional[list]:
+    """CORE_FETCH_TOPICS: satir ya da ';' ile ayrilmis sorgular."""
+    raw = os.environ.get("CORE_FETCH_TOPICS", "").strip()
+    if not raw:
+        return None
+    parts = [t.strip() for chunk in raw.split("\n") for t in chunk.split(";")]
+    return [t for t in parts if t] or None
 
 
 def _headers() -> dict:
@@ -206,6 +275,8 @@ def make_text(record: dict[str, Any]) -> Optional[str]:
     year = record.get("yearPublished") or record.get("year") or ""
 
     body = full_text if len(full_text) > len(abstract) else abstract
+    if MAX_TEXT_CHARS > 0 and len(body) > MAX_TEXT_CHARS:
+        body = body[:MAX_TEXT_CHARS]
     if len(body) < MIN_TEXT_CHARS:
         return None
 
@@ -279,21 +350,56 @@ def fetch(query: str, *, limit: int, dry_run: bool = False) -> dict[str, Any]:
     return summary
 
 
+def _with_lang(query: str) -> str:
+    """Konu sorgusuna dil filtresini ekler (zaten varsa dokunmaz)."""
+    if not LANG_FILTER or LANG_FILTER in query:
+        return query
+    return f"{query} AND {LANG_FILTER}"
+
+
 def main(argv: Optional[list] = None) -> int:
     p = argparse.ArgumentParser(description="CORE API'den (core.ac.uk) psikoloji literaturu cek")
-    p.add_argument("--query", type=str, default=DEFAULT_QUERY, help="CORE arama sorgusu")
-    p.add_argument("--limit", type=int, default=50, help="En fazla kac makale cekilsin")
+    p.add_argument("--query", type=str, default=None,
+                   help="Tek bir CORE arama sorgusu. Verilmezse konu listesi dolasilir.")
+    p.add_argument("--topics", action="store_true",
+                   help="Konu listesini acikca kullan (--query verilmediginde zaten varsayilan)")
+    p.add_argument("--limit", type=int, default=50,
+                   help="KONU BASINA en fazla kac makale cekilsin")
     p.add_argument("--dry-run", action="store_true", help="Dosya yazma, sadece raporla")
     args = p.parse_args(argv)
 
-    try:
-        summary = fetch(args.query, limit=args.limit, dry_run=args.dry_run)
-    except Exception as e:
-        print(f"[core_fetch] hata: {e}", file=sys.stderr)
-        return 1
+    if args.query and not args.topics:
+        queries = [args.query]
+    else:
+        queries = _topics_from_env() or DEFAULT_TOPICS
 
-    print(f"[core_fetch] sonuc: {summary}")
-    if not args.dry_run and summary["written"] > 0:
+    total = {"fetched": 0, "written": 0, "skipped_duplicate": 0, "skipped_short": 0}
+    failed = 0
+    for idx, q in enumerate(queries, 1):
+        full = _with_lang(q)
+        label = q if len(q) <= 64 else q[:61] + "..."
+        print(f"[core_fetch] konu {idx}/{len(queries)}: {label}")
+        try:
+            summary = fetch(full, limit=args.limit, dry_run=args.dry_run)
+        except Exception as e:
+            # TEK KONUNUN HATASI BUTUN CEKIMI IPTAL ETMEMELI. Bir konu
+            # sorgusu CORE tarafindan reddedilirse ya da tekrar denemeler
+            # tukenirse digerleri yine de calissin; aksi halde tek bir
+            # aksilik corpus'un tamamini gunceltmeden birakiyor.
+            failed += 1
+            print(f"[core_fetch] konu basarisiz ({label}): {e}", file=sys.stderr)
+            continue
+        for k in total:
+            total[k] += summary.get(k, 0)
+        print(f"[core_fetch]   -> {summary}")
+
+    total["topics"] = len(queries)
+    total["failed_topics"] = failed
+    total["dry_run"] = args.dry_run
+    print(f"[core_fetch] sonuc: {total}")
+    if failed:
+        print(f"[core_fetch] UYARI: {failed}/{len(queries)} konu cekilemedi.", file=sys.stderr)
+    if not args.dry_run and total["written"] > 0:
         print(f"[core_fetch] Simdi calistir: python -m rag.ingest.psychology {DEST_DIR}")
     return 0
 
