@@ -111,10 +111,10 @@ LOCAL_LLM_BASE_URL=http://127.0.0.1:8001/v1
 LOCAL_LLM_MODEL=hissechat-local
 LOCAL_LLM_API_KEY=local-dev-key
 
-LLM_PROVIDER_ORDER=local,digitalocean,groq,together,deepseek,openai,anthropic
+LLM_PROVIDER_ORDER=local,groq,together,deepseek,openai,anthropic
 LLM_ROUTE_BRIEF=local:hissechat-local
 LLM_ROUTE_STANDARD=local:hissechat-local
-LLM_ROUTE_DEEP=digitalocean:anthropic-claude-sonnet-4-6
+LLM_ROUTE_DEEP=openai:gpt-4.1
 ```
 
 > Not: Tool-calling path'i (`llm/tools.py`) varsayilan olarak `local` provider

@@ -16,7 +16,7 @@ class LlmRouter:
             p.strip().lower()
             for p in os.environ.get(
                 "LLM_PROVIDER_ORDER",
-                "digitalocean,groq,together,deepseek,openai,anthropic,local",
+                "groq,together,deepseek,openai,anthropic,local",
             ).split(",")
             if p.strip()
         ]
@@ -46,26 +46,30 @@ class LlmRouter:
 
         self.models = {
             "digitalocean": os.environ.get("DIGITALOCEAN_MODEL", "openai-gpt-5-mini"),
-            "groq": os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
+            "groq": os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b"),
             "together": os.environ.get("TOGETHER_MODEL", "meta-llama/Llama-3.3-70B-Instruct-Turbo"),
             "deepseek": os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
             "openai": os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
             "anthropic": os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
             "local": os.environ.get("LOCAL_LLM_MODEL", "hissechat-local"),
         }
-        # detailLevel -> provider:model (production defaults: DigitalOcean)
-        # - brief    : GPT-5 Nano  ($0.05 / $0.40)  - hizli, ucuz, Turkce iyi
-        # - standard : GPT-5 Mini  ($0.25 / $2.00)  - fiyat/performans lideri
-        # - deep     : Claude Sonnet 4.6 ($3 / $15) - uzun finansal rapor / KAP analizi
+        # detailLevel -> provider:model (production defaults: Groq + OpenAI)
+        # DigitalOcean Gradient AI su an kullanilmiyor; provider kodu duruyor,
+        # geri almak icin LLM_PROVIDER_ORDER + LLM_ROUTE_* env'lerine eklemek yeter.
+        # - brief    : Groq gpt-oss-20b   - en dusuk gecikme, Turkce iyi
+        # - standard : Groq gpt-oss-120b  - fiyat/performans, tool calling destekli
+        # - deep     : OpenAI gpt-4.1     - uzun finansal rapor / KAP analizi (1M ctx)
+        # NOT: gpt-5 ailesi bu router'in payload'i ile UYUMSUZ (max_tokens yerine
+        # max_completion_tokens ister, temperature'i kabul etmez) - deep icin gpt-4.1.
         self.detail_routes = {
             "brief": self._parse_route(
-                os.environ.get("LLM_ROUTE_BRIEF", "digitalocean:openai-gpt-5-nano")
+                os.environ.get("LLM_ROUTE_BRIEF", "groq:openai/gpt-oss-20b")
             ),
             "standard": self._parse_route(
-                os.environ.get("LLM_ROUTE_STANDARD", "digitalocean:openai-gpt-5-mini")
+                os.environ.get("LLM_ROUTE_STANDARD", "groq:openai/gpt-oss-120b")
             ),
             "deep": self._parse_route(
-                os.environ.get("LLM_ROUTE_DEEP", "digitalocean:anthropic-claude-sonnet-4-6")
+                os.environ.get("LLM_ROUTE_DEEP", "openai:gpt-4.1")
             ),
         }
         self.keys = {
@@ -246,8 +250,9 @@ class LlmRouter:
     # ========================================================================
 
     _TOOL_BASE_URLS = {
-        # digitalocean / openai default; digitalocean'a self.do_base_url ile override
+        # digitalocean self.do_base_url ile override edilir (asagida)
         "openai": "https://api.openai.com/v1",
+        "groq": "https://api.groq.com/openai/v1",
         "together": "https://api.together.xyz/v1",
         "deepseek": "https://api.deepseek.com/v1",
         "local": None,
@@ -264,6 +269,21 @@ class LlmRouter:
     @classmethod
     def is_vision_capable(cls, provider: str) -> bool:
         return (provider or "").strip().lower() in cls._VISION_CAPABLE_PROVIDERS
+
+    def vision_provider(self) -> Optional[str]:
+        """Resim iceren istekler icin kullanilabilir ilk vision-capable provider.
+
+        Onceden burasi "digitalocean" diye sabitti; DO listeden cikinca resimli
+        istek anahtarsiz bir provider'a zorlanip komple duserdi. Artik
+        provider_order icinden anahtari olan ilk vision-capable provider secilir
+        (bugun openai; DO geri gelirse sirada nerdeyse orasi)."""
+        for p in self.provider_order:
+            if self.is_vision_capable(p) and self._is_enabled(p):
+                return p
+        for p in self._VISION_CAPABLE_PROVIDERS:
+            if self._is_enabled(p):
+                return p
+        return None
 
     @staticmethod
     def _strip_images_from_messages(messages: List[dict]) -> List[dict]:
@@ -765,9 +785,22 @@ class LlmRouter:
         messages = self._prepare_messages_for_provider(messages, provider)
 
         if provider == "groq":
-            # Groq SDK stream -> normalize to text chunks
+            # Groq SDK stream -> normalize to text chunks.
+            # SDK yoksa (paket kurulmamis / init patlamis) generic OpenAI-uyumlu
+            # SSE yoluna dus: Groq ucu bunu zaten destekliyor. Eskiden burada
+            # hata firlatiliyordu; brief/standard artik groq-first oldugu icin
+            # bu her stream isteginde bosa bir failover turu demekti.
             if not self._groq_stream_client:
-                raise RuntimeError("groq streaming client unavailable")
+                yield from self._stream_openai_compatible(
+                    base_url="https://api.groq.com/openai/v1",
+                    api_key=key,
+                    model=model,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+                return
             params = {
                 "model": model,
                 "messages": messages,
