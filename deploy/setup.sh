@@ -36,6 +36,18 @@ else
     echo "✅ Swap zaten mevcut"
 fi
 
+# 3b. Ağ tamponları (mediasoup WebRTC UDP yükü için)
+echo "📡 UDP tampon ayarları yapılıyor..."
+cat > /etc/sysctl.d/99-webrtc.conf <<'EOF'
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.core.netdev_max_backlog = 10000
+EOF
+sysctl --system > /dev/null
+echo "✅ sysctl ayarları uygulandı"
+
 # 4. Virtual environment
 echo "🐍 Python ortamı hazırlanıyor..."
 cd $APP_DIR
@@ -69,11 +81,20 @@ ln -sf /etc/nginx/sites-available/tensorflow-api /etc/nginx/sites-enabled/
 rm -f /etc/nginx/sites-enabled/default
 nginx -t && systemctl restart nginx
 
-# 7. Firewall
-echo "🔥 Firewall ayarlanıyor..."
-ufw allow 'Nginx Full'
-ufw allow OpenSSH
-ufw --force enable
+# 7. Firewall: DigitalOcean Cloud Firewall kullanılıyor, ufw yönetilmiyor.
+# (ufw her RTP akışını conntrack'te izler ve kural seti iki yerde tutulmak zorunda kalır.)
+# mediasoup RTC portları: media-server.service ile aynı .env'den okunur
+RTC_MIN_PORT=$(grep -E '^MEDIASOUP_MIN_PORT=' "$APP_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '\r"')
+RTC_MAX_PORT=$(grep -E '^MEDIASOUP_MAX_PORT=' "$APP_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '\r"')
+RTC_MIN_PORT=${RTC_MIN_PORT:-10000}
+RTC_MAX_PORT=${RTC_MAX_PORT:-19999}
+echo "🔥 Cloud Firewall inbound kuralları şunlar olmalı:"
+echo "   TCP 22 (SSH), TCP 80, TCP 443 (nginx)"
+echo "   UDP ${RTC_MIN_PORT}-${RTC_MAX_PORT}, TCP ${RTC_MIN_PORT}-${RTC_MAX_PORT} (mediasoup)"
+echo "   8000 (gunicorn) ve 6379 (redis) AÇILMAMALI"
+if command -v ufw > /dev/null && ufw status | grep -q "Status: active"; then
+    echo "⚠️  ufw aktif: Cloud Firewall ile çakışmaması için 'ufw disable' düşünün"
+fi
 
 echo ""
 echo "✅ Kurulum Tamamlandı!"

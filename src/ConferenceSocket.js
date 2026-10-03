@@ -86,7 +86,9 @@ const mediasoupConfig = {
     enableTcp: true, // IMPORTANT: Enable TCP fallback for firewall issues
     preferUdp: true, // Prefer UDP but allow TCP fallback
     initialAvailableOutgoingBitrate: 1000000,
-    maxIncomingBitrate: 1500000,
+    // Yayinci basina (kamera simulcast + ekran + ses). 1.5 Mbps ust
+    // simulcast katmanini (2.5-5 Mbps) hic gonderilemez yapiyordu.
+    maxIncomingBitrate: parseInt(process.env.MEDIASOUP_MAX_INCOMING_BITRATE, 10) || 8000000,
   },
 };
 
