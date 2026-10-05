@@ -492,7 +492,7 @@ module.exports = {
             initialAvailableOutgoingBitrate: 1000000,
             minimumAvailableOutgoingBitrate: 600000,
             maxSctpMessageSize: 262144,
-            maxIncomingBitrate: 1500000,
+            maxIncomingBitrate: parseInt(process.env.MEDIASOUP_MAX_INCOMING_BITRATE, 10) || 8000000,
         },
         //announcedAddress: 'genel statik IPV4 adresi' ile değiştirin https://api.ipify.org (string yazın --> 'xx.xxx.xxx.xx', xx.xxx.xxx.xx değil)
         //announcedAddress: '' sunucu başlatıldığında otomatik olarak algılanacak, docker localPC için '127.0.0.1' ayarlanacak, aksi takdirde 'genel statik IPV4 adresi''

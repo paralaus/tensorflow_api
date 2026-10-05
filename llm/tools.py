@@ -331,7 +331,11 @@ def _dispatch_parallel(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, str]]
 # ====================================================================
 
 # Provider whitelist: paralel tool destekli + iyi schema uyumu
-_TOOL_CAPABLE_PROVIDERS = {"digitalocean", "openai"}
+# groq: OpenAI-format tool calling + parallel_tool_calls destekliyor
+# (gpt-oss-120b / gpt-oss-20b ile dogrulandi). DO listeden cikinca tek
+# tool-capable saglayici openai kalmasin diye eklendi - openai coktugunde
+# tool dongusu tamamen kapanip "fallback_no_tools"a dusuyordu.
+_TOOL_CAPABLE_PROVIDERS = {"digitalocean", "groq", "openai"}
 
 
 def is_tool_capable(provider: Optional[str]) -> bool:

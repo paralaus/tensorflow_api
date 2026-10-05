@@ -48,6 +48,7 @@ const fs = require('fs');
 const dgram = require('dgram');
 const nodeCrypto = require('crypto');
 const config = require('./config');
+const { describeWorkerFailure } = require('./mediasoupWorkerError');
 const checkXSS = require('./XSS.js');
 const Host = require('./Host');
 const Room = require('./Room');
@@ -558,7 +559,7 @@ async function startLiveHlsForRoom(roomId) {
                 // H.264 yerine VP8 yolladığında transcode kaçınılmaz. CPU
                 // bütçesini taşmaması için: çözünürlük 720p'ye düşürülür
                 // (mobil için zaten yeterli), preset ultrafast, x264 thread
-                // limiti 4 (8vCPU'da diğer yayınlara yer bırakır).
+                // limiti 2 (4vCPU'da mediasoup, 360p encode ve API'ye yer bırakır).
                 '-c:v', 'libx264',
                 '-preset', 'ultrafast',
                 '-tune', 'zerolatency',
@@ -575,7 +576,7 @@ async function startLiveHlsForRoom(roomId) {
                 // olsun her 2sn'de IDR -> her segment kendi keyframe'i ile baslar).
                 '-force_key_frames', 'expr:gte(t,n_forced*2)',
                 '-sc_threshold', '0',
-                '-threads', '4',
+                '-threads', '2',
                 '-b:v', '1200k',
                 '-maxrate', '1400k',
                 '-bufsize', '2800k',
@@ -827,8 +828,10 @@ async function startLiveHlsForRoom(roomId) {
             setTimeout(requestKf, 1500),
             setTimeout(requestKf, 3000),
         ];
-        // Periodic keyframe nudge every 5s while the pipeline is alive.
-        pipeline.kfInterval = setInterval(requestKf, 5000);
+        // Periodic keyframe nudge every 2s while the pipeline is alive.
+        // H.264 passthrough'ta IDR'leri yayinci uretir; hls_time=2 ile
+        // hizali olmasi icin 2sn (5sn'de segmentler ~5sn uzuyordu).
+        pipeline.kfInterval = setInterval(requestKf, 2000);
 
         const session = liveBroadcastSessions.get(roomId);
         if (session) {
@@ -1257,7 +1260,10 @@ const io = require('socket.io')(httpsServer, {
 // goes through ConferenceSocket, while live HLS pipeline state lives here
 // in Server.js — the hook bridges the two.
 const conferenceSocketMod = require('./ConferenceSocket');
-conferenceSocketMod(io).catch(err => console.error('Failed to init conference socket:', err));
+conferenceSocketMod(io).catch(err => {
+    console.error('Failed to init conference socket:', err);
+    console.error(describeWorkerFailure(err));
+});
 conferenceSocketMod.setOnProducerAddedHook((roomId) => {
     try {
         maybeStartLiveHlsForRoom(roomId);
@@ -2387,6 +2393,10 @@ function startServer() {
             await createWorkers();
         } catch (err) {
             log.error('İşleyici yaratma HATASI --->', err);
+            // mediasoup only gives `[pid:NN, code:NN, signal:null]` here; the
+            // worker's stderr with the real reason goes through `debug` and is
+            // dropped unless DEBUG is set. Spell the exit code out instead.
+            log.error(describeWorkerFailure(err));
             process.exit(1);
         }
     })();

@@ -292,7 +292,7 @@ class RoomClient {
         this.enableSharingLayers = true; // Enable simulcast or SVC for screen sharing
         this.numSimulcastStreamsWebcam = 3; // Number of streams for simulcast in webcam
         this.numSimulcastStreamsSharing = 1; // Number of streams for simulcast in screen sharing
-        this.webcamScalabilityMode = 'L3T3'; // Scalability Mode for webcam | 'L1T3' for VP8/H264 (in each simulcast encoding), 'L3T3_KEY' for VP9
+        this.webcamScalabilityMode = 'L1T3'; // Scalability Mode for webcam | 'L1T3' for VP8/H264 (in each simulcast encoding), 'L3T3_KEY' for VP9
         this.sharingScalabilityMode = 'L1T3'; // Scalability Mode for screen sharing | 'L1T3' for VP8/H264 (in each simulcast encoding), 'L3T3' for VP9
 
         this.myVideoEl = null;
